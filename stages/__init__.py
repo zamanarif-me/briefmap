@@ -1,1 +1,1 @@
-"""Stages of the Topical Map Engine pipeline."""
+"""Stages of the BriefMap pipeline."""

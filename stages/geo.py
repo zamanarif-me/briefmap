@@ -28,10 +28,13 @@ def derive_geo_pages(pillars: list[Pillar], geo: GeoTargeting) -> list[GeoPage]:
     if not geos:
         return []
 
-    # Find pillars that already mention a geo in their title — skip those
+    # Find pillars that already mention one of the TARGET geos in their
+    # title — skip those. (Previously this also matched any title containing
+    # " in ", which false-positived on titles like "WordPress Maintenance
+    # in 2026".)
     def is_geographic(pillar: Pillar) -> bool:
         t = pillar.title.lower()
-        return any(g.lower() in t for g in geos) or " in " in t or " for hire" in t
+        return any(g.lower() in t for g in geos)
 
     eligible = [
         p for p in pillars

@@ -1,10 +1,15 @@
 """
-Stage 9: Content Brief Generator — v2 (robust validation)
+Stage 9: Content Brief Generator — v2 (robust validation, SERP-grounded)
 
 All fields have defaults. field_validators handle model quirks:
   - featured_snippet: accepts bool or string ("true"/"yes")
   - relationship_strength: accepts float or text ("strong"/"moderate")
   - HeadingNode.level: normalizes "h2" → "H2"
+
+When real SERP data is available (serp_context), the brief is grounded in
+it: real PAA questions are copied into serp_target.people_also_ask, and
+competitor titles inform the information-gain angle and word count —
+Koray briefs are SERP-informed by definition.
 """
 
 import json
@@ -198,6 +203,22 @@ _INSTRUCTIONS = (
 
 # ── Generators ────────────────────────────────────────────────────────────────
 
+def _serp_block(serp_context: str) -> str:
+    """Format real SERP data for the brief prompt — empty string if none."""
+    if not serp_context.strip():
+        return ""
+    return (
+        "\n# REAL SERP DATA (from live Google results — use it)\n"
+        "Ground the brief in this data:\n"
+        "- Copy real People-Also-Ask questions into serp_target.people_also_ask "
+        "(do NOT invent PAA questions when real ones are listed).\n"
+        "- Make the information_gain_angle something the ranking competitors "
+        "below do NOT already cover.\n"
+        "- Calibrate recommended_word_count against the competition shown.\n\n"
+        + serp_context + "\n"
+    )
+
+
 def generate_brief_for_pillar(
     pillar: Pillar,
     topical_map: TopicalMap,
@@ -208,6 +229,7 @@ def generate_brief_for_pillar(
     user_message = (
         "Generate a complete content brief for this PILLAR page.\n"
         + _INSTRUCTIONS + "\n"
+        + _serp_block(serp_context)
         + "# Page Context\n"
         + json.dumps(ctx, indent=2)
     )
@@ -216,6 +238,8 @@ def generate_brief_for_pillar(
         user_message=user_message,
         response_model=ContentBrief,
         max_tokens=8000,
+        temperature=0.5,   # briefs benefit from some creativity
+        stage="Stage 9 — Brief (pillar)",
     )
 
 
@@ -231,7 +255,8 @@ def generate_brief_for_cluster(
         "Generate a complete content brief for this CLUSTER page.\n"
         + _INSTRUCTIONS + "\n"
         "Include at least one contradiction/myth-busting H2.\n"
-        "# Page Context\n"
+        + _serp_block(serp_context)
+        + "# Page Context\n"
         + json.dumps(ctx, indent=2)
     )
     return call_anthropic_structured(
@@ -239,6 +264,8 @@ def generate_brief_for_cluster(
         user_message=user_message,
         response_model=ContentBrief,
         max_tokens=8000,
+        temperature=0.5,
+        stage="Stage 9 — Brief (cluster)",
     )
 
 
@@ -247,11 +274,12 @@ def generate_briefs_for_pillar_and_clusters(
     topical_map: TopicalMap,
     include_clusters: bool = True,
     max_clusters: int = 2,
+    serp_context: str = "",
 ) -> dict[str, ContentBrief]:
     briefs: dict[str, ContentBrief] = {}
     print(f"  Pillar: {pillar.title}")
     try:
-        briefs[pillar.id] = generate_brief_for_pillar(pillar, topical_map)
+        briefs[pillar.id] = generate_brief_for_pillar(pillar, topical_map, serp_context)
         print("    Pillar brief done")
     except Exception as e:
         print(f"    Pillar failed: {e}")
@@ -260,7 +288,7 @@ def generate_briefs_for_pillar_and_clusters(
         for cluster in pillar.clusters[:max_clusters]:
             print(f"  Cluster: {cluster.title[:55]}")
             try:
-                briefs[cluster.id] = generate_brief_for_cluster(cluster, pillar, topical_map)
+                briefs[cluster.id] = generate_brief_for_cluster(cluster, pillar, topical_map, serp_context)
                 print("    Cluster brief done")
             except Exception as e:
                 print(f"    Cluster failed: {e}")
@@ -347,7 +375,7 @@ def save_briefs(briefs: dict[str, ContentBrief], output_dir) -> list[Path]:
         for k, v in brief.quality_checklist.items():
             lines.append(f"- [{'x' if v else ' '}] {k}")
 
-        path.write_text("\n".join(lines))
+        path.write_text("\n".join(lines), encoding="utf-8")
         paths.append(path)
         print(f"  Saved: {path.name}")
 
@@ -355,7 +383,7 @@ def save_briefs(briefs: dict[str, ContentBrief], output_dir) -> list[Path]:
     json_path.write_text(json.dumps(
         {pid: b.model_dump(mode="json") for pid, b in briefs.items()},
         indent=2,
-    ))
+    ), encoding="utf-8")
     paths.append(json_path)
 
     # CSV + DOCX bundles

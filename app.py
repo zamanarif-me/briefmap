@@ -1,5 +1,7 @@
 """
-Topical Map Engine — Streamlit UI
+BriefMap — Streamlit UI
+
+Koray-framework semantic topical maps, query networks, and content briefs.
 
 Run with:
     streamlit run app.py
@@ -11,7 +13,7 @@ Requirements:
 import streamlit as st
 
 st.set_page_config(
-    page_title="Topical Map Engine",
+    page_title="BriefMap",
     page_icon="🗺️",
     layout="wide",
     initial_sidebar_state="collapsed",

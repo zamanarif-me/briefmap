@@ -1,12 +1,12 @@
-# Topical Map Engine Pro
+# BriefMap
 
-A Python engine that generates Koray-style semantic topical maps from a seed keyword and 8 intake answers. Hybrid: Anthropic Sonnet for reasoning, Gemini Flash for validation, Serper.dev for SERP/PAA intelligence.
+A Python engine that generates Koray-style semantic topical maps, query networks, and SERP-grounded content briefs from a seed keyword and 8 intake answers. Hybrid: Anthropic Sonnet for reasoning, Gemini Flash for validation fallback + supplementary nodes, Serper.dev for SERP/PAA intelligence.
 
 ## Deploy to Streamlit Cloud
 
-1. **Push to GitHub** — create a new repo (recommended name: `topical-map-engine-pro`) and push the contents of this directory.
+1. **Push to GitHub** — create a new repo (recommended name: `briefmap`) and push the contents of this directory.
 2. **Create a Streamlit Cloud app** at https://share.streamlit.io
-   - Repository: `<your-username>/topical-map-engine-pro`
+   - Repository: `<your-username>/briefmap`
    - Branch: `main`
    - Main file: `app.py`
    - Python version: pinned to `3.11` via `runtime.txt`
@@ -30,8 +30,9 @@ streamlit run app.py
 ### Notes
 
 - Streamlit Cloud has an **ephemeral filesystem** — saved sessions and outputs reset on app restart. For persistent storage, mount S3/GCS later.
-- Brief generation runs in a **background thread** to avoid request timeouts; keep the tab open while a batch is running.
-- Cost: roughly `$0.10` per content brief, `$0.30–0.80` per full pillar map (depending on Serper usage).
+- Brief generation runs in a **background thread** to avoid request timeouts; each finished brief is checkpointed to disk, so re-running after a disconnect skips already-generated briefs.
+- All three API keys are required: `ANTHROPIC_API_KEY` (stages 2/3/5/7/9), `GEMINI_API_KEY` (stages 4 fallback + 6), `SERPER_API_KEY` (stage 3.5).
+- Cost: roughly `$0.05–0.10` per content brief (prompt caching + structured outputs), `$0.25–0.50` per full topical map.
 
 ---
 
@@ -114,18 +115,19 @@ Output appears at `examples/wordpress_dev/output/topical_map.json` and `topical_
 
 ## Cost per run
 
-| Stage | API calls | Approx cost |
-|-------|-----------|-------------|
-| 2 — Central Entity | 1 | $0.01 |
-| 3 — Topic Expansion | 1 | $0.05 |
-| 4 — Web Validation | ~11 (one per pillar) | $0.20-0.40 |
-| 5 — Query Generation | ~11 | $0.10 |
-| 6 — Supplementary | ~11 | $0.10 |
-| 7 — Internal Linking | ~11 | $0.20 |
-| 8 — Render | 0 | free |
-| **Total** | ~46 | **~$0.50-1.00** |
+| Stage | Model | API calls | Approx cost |
+|-------|-------|-----------|-------------|
+| 2 — Central Entity | Sonnet | 1 | $0.01 |
+| 3 — Topic Expansion | Sonnet | 1 | $0.05-0.10 |
+| 3.5 — SERP pull | Serper | ~11 (one per pillar) | free tier |
+| 4 — Validation | data-driven (free) / Gemini Flash fallback | 0-1 | ~$0.00 |
+| 5 — Query Generation | Sonnet (batched, cached) | ~2 | $0.05-0.10 |
+| 6 — Supplementary | Gemini Flash | ~11 | $0.01-0.02 |
+| 7 — Internal Linking | deterministic + 1 Sonnet call (bridges) | 1 | $0.03-0.05 |
+| 8 — Render | none | 0 | free |
+| **Total** | | ~17 | **~$0.25-0.50** |
 
-Skip stage 4 (`skip_validation=True`) to cut cost roughly in half during prompt iteration.
+Anthropic calls use prompt caching and forced tool-use (structured outputs), which cuts repeated-context input cost ~90% and eliminates most JSON-retry waste. Skip stage 3.5 (`skip_serp=True`) during prompt iteration to save Serper quota — stage 4 then falls back to one Gemini Flash call.
 
 ## Honest limitations
 

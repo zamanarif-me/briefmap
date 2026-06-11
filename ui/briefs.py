@@ -3,8 +3,17 @@ Briefs page — async brief generation with progress tracking.
 
 Uses threading to avoid Streamlit Cloud timeout.
 Progress is shown via polling — user sees real-time updates.
+
+Logging uses an on_log callback into the shared state dict — the previous
+implementation monkey-patched builtins.print process-wide, which raced
+between concurrent sessions and could leave print broken after overlap.
+
+Generated briefs are checkpointed to disk per page (see brief_batch), so a
+reconnect mid-batch only costs the brief that was in flight: clicking
+Generate again skips every brief that already finished.
 """
 
+import html
 import time
 import threading
 import streamlit as st
@@ -14,6 +23,18 @@ from ui.router import set_page
 
 
 # ── Background worker ─────────────────────────────────────────────────────────
+
+def _load_serp_context(output_dir: str, pillar_id: str) -> str:
+    """Load persisted real SERP data for this pillar, if the pipeline saved it."""
+    try:
+        from stages.serp import load_serp_data, serp_data_to_summary
+        serp_data = load_serp_data(Path(output_dir) / "serp_data.json")
+        if serp_data and pillar_id in serp_data:
+            return serp_data_to_summary(serp_data[pillar_id])
+    except Exception:
+        pass
+    return ""
+
 
 def _run_brief_generation(
     pillar_id: str,
@@ -38,34 +59,29 @@ def _run_brief_generation(
 
         state["status"] = f"Generating pillar brief: {pillar.title[:50]}..."
 
-        # Override print to capture progress
-        import builtins
-        original_print = builtins.print
-
-        def capture_print(*args, **kwargs):
-            msg = " ".join(str(a) for a in args)
+        def on_log(msg: str) -> None:
             state["logs"].append(msg)
             state["status"] = msg
-            original_print(*args, **kwargs)
 
-        builtins.print = capture_print
+        serp_context = _load_serp_context(output_dir, pillar_id)
+        if serp_context:
+            on_log("Real SERP data loaded — briefs will use live PAA/competitor data")
 
-        try:
-            briefs_dir = Path(output_dir) / "briefs"
-            package = run_batch_for_pillar(
-                pillar=pillar,
-                topical_map=output.topical_map,
-                output_dir=briefs_dir,
-                include_clusters=max_clusters > 0,
-                max_clusters=max_clusters,
-                delay_between_calls=0.5,
-                auto_correct_ids=True,
-            )
-            state["package"]  = package
-            state["done"]     = True
-            state["status"]   = f"Done! {package.total_generated} briefs generated."
-        finally:
-            builtins.print = original_print
+        briefs_dir = Path(output_dir) / "briefs"
+        package = run_batch_for_pillar(
+            pillar=pillar,
+            topical_map=output.topical_map,
+            output_dir=briefs_dir,
+            include_clusters=max_clusters > 0,
+            max_clusters=max_clusters,
+            delay_between_calls=0.5,
+            auto_correct_ids=True,
+            serp_context=serp_context,
+            on_log=on_log,
+        )
+        state["package"]  = package
+        state["done"]     = True
+        state["status"]   = f"Done! {package.total_generated} briefs generated."
 
     except Exception as e:
         import traceback
@@ -216,7 +232,7 @@ def render_briefs():
         </div>
         <div style="font-size:0.78rem; color:#6b6b8a; font-family:DM Mono,monospace;
                     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-            {status[:80]}
+            {html.escape(status[:80])}
         </div>
     </div>
 </div>
@@ -226,7 +242,7 @@ def render_briefs():
                 log_html = (
                     "<div class='log-box' style='max-height:180px;'>"
                     + "<br>".join(
-                        f"<span style='color:{'#43e97b' if 'done' in l.lower() or 'saved' in l.lower() else '#6b6b8a'}'>{l}</span>"
+                        f"<span style='color:{'#43e97b' if 'done' in l.lower() or 'saved' in l.lower() else '#6b6b8a'}'>{html.escape(l)}</span>"
                         for l in logs[-12:]
                     )
                     + "</div>"
@@ -271,7 +287,7 @@ def render_briefs():
             if path.exists() and not path.name.startswith("_"):
                 st.download_button(
                     label=f"📄 {path.stem.replace('brief_', '')}",
-                    data=path.read_text(),
+                    data=path.read_text(encoding="utf-8"),
                     file_name=path.name,
                     mime="text/markdown",
                     key=f"dl_{path.stem}",
@@ -283,7 +299,7 @@ def render_briefs():
         if json_path.exists():
             st.download_button(
                 label="📦 all_briefs.json",
-                data=json_path.read_text(),
+                data=json_path.read_text(encoding="utf-8"),
                 file_name="all_briefs.json",
                 mime="application/json",
                 key="dl_all_briefs",

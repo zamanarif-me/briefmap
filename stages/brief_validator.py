@@ -179,33 +179,52 @@ def _auto_correct(
     issues: list[ValidationIssue],
     registry: PageRegistry,
 ) -> ContentBrief:
-    """Replace bad IDs with the best suggestion if confidence > 0.3."""
-    # Build correction map
-    corrections: dict[str, str] = {}
+    """
+    Replace bad IDs with the best suggestion if confidence > 0.3.
+
+    When NO suggestion clears the confidence bar, the reference is DROPPED
+    (bridge removed / next_destination cleared) rather than silently
+    rewritten to an arbitrary page — a confidently wrong internal link is
+    worse for the writer than an explicitly missing one. The issue stays
+    in the validation report either way.
+    """
+    # Build correction map: bad_id → real_id, or None meaning "drop it"
+    corrections: dict[str, str | None] = {}
     for issue in issues:
         if issue.suggestions and issue.suggestions[0][2] > 0.30:
             corrections[issue.bad_id] = issue.suggestions[0][0]
         else:
-            # No good match — use first real pillar as safe fallback
-            first_id = next(iter(registry.pages))
-            corrections[issue.bad_id] = first_id
+            corrections[issue.bad_id] = None
 
     # Deep copy via model_dump + reconstruct
     data = brief.model_dump(mode="json")
 
-    # Fix bridges
+    # Fix bridges — drop those with no credible correction
+    fixed_bridges = []
     for bridge in data["semantic_bridges"]:
         bad = bridge["link_destination"]
         if bad in corrections:
-            bridge["link_destination"] = corrections[bad]
+            replacement = corrections[bad]
+            if replacement is None:
+                continue  # drop the bridge entirely
+            bridge["link_destination"] = replacement
+        fixed_bridges.append(bridge)
+    data["semantic_bridges"] = fixed_bridges
 
-    # Fix next destination
+    # Fix next destination — clear it if no credible correction
     bad_next = data["next_destination"]["next_page_id"]
     if bad_next in corrections:
-        data["next_destination"]["next_page_id"] = corrections[bad_next]
-        # Update title too
-        corrected_id = corrections[bad_next]
-        data["next_destination"]["next_page_title"] = registry.pages[corrected_id]
+        replacement = corrections[bad_next]
+        if replacement is None:
+            data["next_destination"]["next_page_id"] = ""
+            data["next_destination"]["next_page_title"] = ""
+            data["next_destination"]["transition_reason"] = (
+                "REMOVED — the model referenced a page that does not exist "
+                "in the topical map. Pick a destination manually."
+            )
+        else:
+            data["next_destination"]["next_page_id"] = replacement
+            data["next_destination"]["next_page_title"] = registry.pages[replacement]
 
     return ContentBrief.model_validate(data)
 

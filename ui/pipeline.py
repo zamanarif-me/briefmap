@@ -36,6 +36,7 @@ Resume policy
 
 from __future__ import annotations
 
+import html
 import os
 import threading
 import time
@@ -46,6 +47,14 @@ import streamlit as st
 
 from ui import run_state
 from ui.router import set_page, clear_run
+
+# Load .env BEFORE any API-key checks — previously the key check ran first,
+# so keys that lived only in a .env file were incorrectly reported missing.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 # ── Background worker ─────────────────────────────────────────────────────────
@@ -139,8 +148,10 @@ STAGE_LABELS = {
 
 
 def _check_api_keys() -> list[str]:
+    # GEMINI_API_KEY is required too: Stage 6 (supplementary) runs on Gemini
+    # Flash, and Stage 4 falls back to Gemini when SERP is skipped.
     missing = []
-    for key in ["ANTHROPIC_API_KEY", "SERPER_API_KEY"]:
+    for key in ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "SERPER_API_KEY"]:
         if not os.environ.get(key):
             missing.append(key)
     return missing
@@ -192,7 +203,7 @@ def _render_progress_panel(progress: dict, run_id: str) -> None:
     </div>
     <div style="font-size:0.78rem; color:#6b6b8a; font-family:DM Mono,monospace;
                 white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
-        {progress.get("message", "")[:120]}
+        {html.escape(progress.get("message", "")[:120])}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -228,13 +239,6 @@ def render_pipeline():
             set_page("home")
             st.rerun()
         return
-
-    # Load dotenv if present
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
 
     run_id = st.session_state.get("active_run_id")
 
@@ -345,39 +349,31 @@ def render_pipeline():
                 st.rerun()
         return
 
-    # ── State: running_stale (>2 min since last heartbeat) ───────────────────
-    if status == "running_stale":
-        age = int(progress.get("last_updated_at") and run_state._seconds_since(progress["last_updated_at"]) or 0)
-        st.warning(
-            f"⚠️ This run hasn't updated in {age} seconds. The previous worker "
-            f"likely died (network drop or page reload). You can resume from "
-            f"the last completed stage or start fresh."
-        )
-        _render_progress_panel(progress, run_id)
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("▶️  Resume from last checkpoint", use_container_width=True, type="primary"):
-                seed = run_state.load_seed(run_id)
-                settings = run_state.load_settings(run_id)
-                if seed:
-                    run_state.heartbeat(run_id, "Resuming...")
-                    _spawn_worker(run_id, seed, settings)
-                st.rerun()
-        with col2:
-            if st.button("🗑️  Discard & start fresh", use_container_width=True):
-                run_state.delete_run(run_id)
-                clear_run()
-                set_page("intake")
-                st.rerun()
-        return
-
-    # ── State: running_active ────────────────────────────────────────────────
-    # Heartbeat within 2 min. If our process lost the worker thread, re-spawn.
-    if not _worker_alive(run_id):
+    # ── State: running ───────────────────────────────────────────────────────
+    # No time limit on resume. If the worker thread is gone (e.g. process
+    # restart, network drop that killed the script, or a silent crash),
+    # we re-spawn it automatically from the last completed checkpoint.
+    worker_was_dead = not _worker_alive(run_id)
+    if worker_was_dead:
         seed = run_state.load_seed(run_id)
         settings = run_state.load_settings(run_id)
         if seed:
+            run_state.heartbeat(run_id, "Auto-resuming from last checkpoint...")
             _spawn_worker(run_id, seed, settings)
+            progress = run_state.read_progress(run_id) or progress
+
+    # Surface how long since the worker last reported progress. Purely
+    # informational — does NOT gate resume.
+    last_ts = progress.get("last_updated_at")
+    if last_ts:
+        age = int(run_state._seconds_since(last_ts))
+        if worker_was_dead:
+            st.info(
+                f"🔄 The previous worker had stopped ({age}s since last update). "
+                f"Restarted automatically — picking up from the last completed checkpoint."
+            )
+        elif age > 30:
+            st.caption(f"Last activity {age}s ago. Stage in progress may take a few minutes for LLM calls.")
 
     _render_progress_panel(progress, run_id)
 
@@ -390,10 +386,24 @@ def render_pipeline():
         ) + "</div>"
         st.markdown(log_html, unsafe_allow_html=True)
 
-    # Cancel button
-    if st.button("⏹  Stop run"):
-        run_state.mark_run_failed(run_id, "Cancelled by user")
-        st.rerun()
+    # Manual controls — escape hatches if the worker really is wedged.
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄  Force restart worker", use_container_width=True,
+                     help="Kill the current heartbeat and re-spawn the worker thread"):
+            seed = run_state.load_seed(run_id)
+            settings = run_state.load_settings(run_id)
+            if seed:
+                # Drop the cached thread entry so _spawn_worker will start a fresh one
+                with _WORKER_LOCK:
+                    _WORKERS.pop(run_id, None)
+                run_state.heartbeat(run_id, "Force-restarting worker...")
+                _spawn_worker(run_id, seed, settings)
+            st.rerun()
+    with col2:
+        if st.button("⏹  Stop run", use_container_width=True):
+            run_state.mark_run_failed(run_id, "Cancelled by user")
+            st.rerun()
 
     # Poll: rerun after 2s to refresh progress
     time.sleep(2)

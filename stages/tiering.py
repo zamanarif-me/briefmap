@@ -1,6 +1,9 @@
 """
 Stage 6: Supplementary Nodes — Per-Pillar (reliable JSON parsing)
 
+Runs on Gemini Flash (cheap) — supplementary node generation is templated
+work and does not need the main reasoning model.
+
 Per-pillar calls = smaller JSON output = no parsing errors.
 Each pillar gets 3-4 supplementary nodes per cluster.
 
@@ -17,7 +20,7 @@ from typing import Optional
 from pydantic import BaseModel
 
 from models import Pillar, Cluster, SupplementaryNode, Intent, FunnelStage
-from stages._client import call_anthropic_structured
+from stages._client import call_gemini_flash_structured, load_prompt
 from stages.serp import SerpData
 
 
@@ -34,35 +37,22 @@ class SupplementaryResponse(BaseModel):
     supplementary_nodes: list[_RawNode]
 
 
-SUPP_PROMPT = """You are a semantic SEO strategist trained on Koray's framework.
+# Full Koray supplementary prompt lives in prompts/supplementary.txt
+# (four angles, anti-patterns, funnel rules). The addendum below pins the
+# per-pillar hard constraints this stage relies on.
+_SUPP_ADDENDUM = """
 
-Generate supplementary (Tier 3) nodes for ONE pillar's clusters.
-Each cluster gets 3-4 nodes mixing these angles:
-  - contradiction: "Why [belief] Is Wrong" or "The Real Reason [X]"
-  - information_gain: "How [mechanism] affects [outcome]"
-  - perspective: "[Topic] from a [Role] perspective"
-  - lifecycle: "[Topic] After [Event/State]"
+# THIS RUN — HARD CONSTRAINTS
 
-Rules:
 - At least 1 contradiction node per cluster (MANDATORY)
 - At least 1 information_gain node per cluster (MANDATORY)
 - parent_cluster_id MUST match one of the cluster IDs given to you exactly — do NOT invent new IDs
 - IDs must be unique — format: supp_<short_slug>
-- Titles must be SPECIFIC and ENTITY-RICH
+- Output ONLY valid JSON matching the schema shown above — no trailing commas, no comments, no fences."""
 
-Output ONLY valid JSON — no trailing commas, no comments, no fences:
-{
-  "supplementary_nodes": [
-    {
-      "id": "supp_unique_slug",
-      "title": "Specific Page Title Here",
-      "parent_cluster_id": "<one of the cluster_ids provided>",
-      "intent": "informational",
-      "funnel_stage": "MOFU",
-      "angle": "contradiction"
-    }
-  ]
-}"""
+
+def _supp_system_prompt() -> str:
+    return load_prompt("supplementary") + _SUPP_ADDENDUM
 
 
 # ── ID matcher ────────────────────────────────────────────────────────────────
@@ -208,11 +198,11 @@ def generate_supplementary_for_pillar(
     fuzzy_corrected = 0
 
     try:
-        resp = call_anthropic_structured(
-            system_prompt=SUPP_PROMPT,
+        resp = call_gemini_flash_structured(
+            system_prompt=_supp_system_prompt(),
             user_message=user_msg,
             response_model=SupplementaryResponse,
-            max_tokens=4000,
+            stage="Stage 6 — Supplementary",
         )
         seen_ids: set[str] = {n.id for c in pillar.clusters for n in c.supplementary_nodes}
         for node in resp.supplementary_nodes:

@@ -11,14 +11,12 @@ def render_home():
     with col1:
         st.markdown("""
 <div class="hero-title">
-    Topical Map<br>
-    <em>Engine</em>
+    Brief<em>Map</em>
 </div>
 <div class="hero-subtitle">
     Generate Koray-framework semantic topical maps,
     query networks, and content briefs — powered by
     Anthropic, Serper, and Gemini.
-    Created by "Zaman Arif"
 </div>
 """, unsafe_allow_html=True)
 

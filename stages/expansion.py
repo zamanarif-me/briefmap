@@ -58,28 +58,46 @@ Generate 8-12 pillars with 6-10 clusters each, following all rules in the system
 
 Output ONLY valid JSON matching the schema."""
 
-    response = call_structured(
-        system_prompt=system_prompt,
-        user_message=user_message,
-        response_model=TopicExpansionResponse,
-        max_tokens=16000,  # this stage produces a lot of output
-    )
-
-    # Light validation: enforce the 8-12 pillar count and 6-10 cluster count
-    # so problems surface here, not 5 stages later.
-    pillar_count = len(response.pillars)
-    if not (6 <= pillar_count <= 14):
-        raise ValueError(
-            f"Topic expansion returned {pillar_count} pillars, expected 8-12. "
-            f"Inspect the output or retry. Pillars: {[p.title for p in response.pillars]}"
-        )
-
-    for pillar in response.pillars:
-        cluster_count = len(pillar.clusters)
-        if not (4 <= cluster_count <= 12):
-            raise ValueError(
-                f"Pillar '{pillar.title}' has {cluster_count} clusters, expected 6-10. "
-                f"Inspect the output or retry."
+    # Structural constraints (with tolerance — the prompt asks for 8-12
+    # pillars / 6-10 clusters; we accept 6-14 / 4-12 before failing).
+    # On violation, retry ONCE with the violation named, instead of
+    # throwing away a paid call immediately.
+    def _constraint_violation(pillars) -> str | None:
+        pillar_count = len(pillars)
+        if not (6 <= pillar_count <= 14):
+            return (
+                f"You returned {pillar_count} pillars but the requirement is 8-12 "
+                f"(tolerance 6-14). Pillars: {[p.title for p in pillars]}"
             )
+        for pillar in pillars:
+            cluster_count = len(pillar.clusters)
+            if not (4 <= cluster_count <= 12):
+                return (
+                    f"Pillar '{pillar.title}' has {cluster_count} clusters but the "
+                    f"requirement is 6-10 (tolerance 4-12)."
+                )
+        return None
 
-    return response.pillars
+    violation: str | None = None
+    for attempt in range(2):
+        message = user_message
+        if violation:
+            message += (
+                f"\n\nIMPORTANT: Your previous response violated a structural rule: "
+                f"{violation} Regenerate the FULL output respecting the pillar and "
+                f"cluster count rules."
+            )
+        response = call_structured(
+            system_prompt=system_prompt,
+            user_message=message,
+            response_model=TopicExpansionResponse,
+            max_tokens=16000,  # this stage produces a lot of output
+            stage="Stage 3 — Topic expansion",
+        )
+        violation = _constraint_violation(response.pillars)
+        if violation is None:
+            return response.pillars
+
+    raise ValueError(
+        f"Topic expansion failed structural validation after retry: {violation}"
+    )

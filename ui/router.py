@@ -24,9 +24,16 @@ Usage:
 
 from __future__ import annotations
 
+import re
+
 import streamlit as st
 
 VALID_PAGES = {"home", "intake", "pipeline", "results", "briefs"}
+
+# IDs restored from the URL are untrusted input — they flow into filesystem
+# paths (runs/<run_id>) — so they must match the minted-id shape exactly.
+_RUN_ID_RE       = re.compile(r"^\d{8}_\d{6}_[a-z0-9_]{1,40}$")
+_BRIEF_PILLAR_RE = re.compile(r"^[a-z0-9_\-]{1,80}$")
 
 
 # ── URL → session_state ──────────────────────────────────────────────────────
@@ -49,15 +56,17 @@ def restore_from_url() -> None:
     elif "page" not in st.session_state:
         st.session_state.page = "home"
 
-    # Run id (in-progress or completed pipeline run)
+    # Run id (in-progress or completed pipeline run).
+    # Reject anything that doesn't look like a minted run id — this is the
+    # security boundary against path traversal via ?run=../../...
     url_run = params.get("run")
-    if url_run:
+    if url_run and _RUN_ID_RE.fullmatch(url_run):
         if st.session_state.get("active_run_id") != url_run:
             st.session_state.active_run_id = url_run
 
     # Brief target pillar id (so brief generation survives reconnect)
     url_brief_pillar = params.get("brief_pillar")
-    if url_brief_pillar:
+    if url_brief_pillar and _BRIEF_PILLAR_RE.fullmatch(url_brief_pillar):
         if st.session_state.get("brief_target_pillar_id") != url_brief_pillar:
             st.session_state.brief_target_pillar_id = url_brief_pillar
 

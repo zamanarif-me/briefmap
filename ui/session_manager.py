@@ -44,6 +44,8 @@ def save_session(output, session_id: str) -> Path:
     Save a completed EngineOutput as a named session.
     Returns the session directory path.
     """
+    import shutil
+
     from stages.render import save_outputs, render_koray_csv
 
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,16 @@ def save_session(output, session_id: str) -> Path:
 
     # Save main output files
     paths = save_outputs(output, out_dir)
+
+    # Copy persisted SERP data from the run dir (if present) so brief
+    # generation from a reloaded session can still use real PAA/competitor
+    # data instead of hallucinating it.
+    try:
+        run_serp = Path("runs") / session_id / "serp_data.json"
+        if run_serp.exists():
+            shutil.copyfile(run_serp, out_dir / "serp_data.json")
+    except Exception:
+        pass
 
     # Build session metadata
     tm = output.topical_map
@@ -73,7 +85,7 @@ def save_session(output, session_id: str) -> Path:
     }
 
     meta_path = out_dir / "session_meta.json"
-    meta_path.write_text(json.dumps(meta, indent=2))
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # Update sessions index
     _update_index(meta)
@@ -90,7 +102,7 @@ def _update_index(meta: dict) -> None:
     sessions.insert(0, meta)
     # Keep last 50 sessions
     sessions = sessions[:50]
-    INDEX_FILE.write_text(json.dumps(sessions, indent=2))
+    INDEX_FILE.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
 
 
 # ── Load ──────────────────────────────────────────────────────────────────────
@@ -100,7 +112,7 @@ def _load_index() -> list[dict]:
     if not INDEX_FILE.exists():
         return []
     try:
-        return json.loads(INDEX_FILE.read_text())
+        return json.loads(INDEX_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
 
@@ -125,9 +137,9 @@ def load_session(session_id: str):
         return None, None
 
     try:
-        data = json.loads(json_path.read_text())
+        data = json.loads(json_path.read_text(encoding="utf-8"))
         output = EngineOutput.model_validate(data)
-        meta   = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        meta   = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
         return output, meta
     except Exception as e:
         print(f"[session] Failed to load {session_id}: {e}")
@@ -141,7 +153,7 @@ def delete_session(session_id: str) -> bool:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     sessions = [s for s in _load_index() if s.get("session_id") != session_id]
-    INDEX_FILE.write_text(json.dumps(sessions, indent=2))
+    INDEX_FILE.write_text(json.dumps(sessions, indent=2), encoding="utf-8")
     return True
 
 

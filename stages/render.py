@@ -86,10 +86,13 @@ def save_outputs(output: EngineOutput, output_dir: str | Path) -> dict[str, Path
     md_path = out_dir / "topical_map_report.md"
 
     # JSON
-    json_path.write_text(json.dumps(output.model_dump(mode="json"), indent=2))
+    json_path.write_text(
+        json.dumps(output.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
 
     # Markdown
-    md_path.write_text(render_markdown(output))
+    md_path.write_text(render_markdown(output), encoding="utf-8")
 
     # CSV (Koray format)
     csv_path = out_dir / "topical_map.csv"

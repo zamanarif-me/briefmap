@@ -20,7 +20,8 @@ Free tier supports ~225 full client maps per month.
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import requests
 
@@ -147,6 +148,52 @@ def pull_serp_for_pillars(
             results[pillar.id] = SerpData(pillar_id=pillar.id, query=pillar.title)
 
     return results
+
+
+# ── Persistence (so briefs can use real SERP data later) ────────────────────
+
+def save_serp_data(serp_data: dict[str, SerpData], path: str | Path) -> None:
+    """Persist SERP data as JSON so Stage 9 (briefs) can ground itself in it."""
+    payload = {
+        pid: {
+            "pillar_id":        s.pillar_id,
+            "query":            s.query,
+            "organic":          [asdict(o) for o in s.organic],
+            "paa":              list(s.paa),
+            "related_searches": list(s.related_searches),
+            "featured_snippet": s.featured_snippet,
+        }
+        for pid, s in serp_data.items()
+    }
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_serp_data(path: str | Path) -> dict[str, SerpData] | None:
+    """Load persisted SERP data. Returns None if missing/corrupt."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    result: dict[str, SerpData] = {}
+    for pid, d in payload.items():
+        sd = SerpData(pillar_id=d.get("pillar_id", pid), query=d.get("query", ""))
+        sd.organic = [
+            OrganicResult(
+                position=o.get("position", 0),
+                title=o.get("title", ""),
+                url=o.get("url", ""),
+                snippet=o.get("snippet", ""),
+            )
+            for o in d.get("organic", [])
+        ]
+        sd.paa              = list(d.get("paa", []))
+        sd.related_searches = list(d.get("related_searches", []))
+        sd.featured_snippet = d.get("featured_snippet", "")
+        result[pid] = sd
+    return result
 
 
 # ── Helpers used by downstream stages ────────────────────────────────────────

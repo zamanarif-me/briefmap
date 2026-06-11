@@ -17,6 +17,7 @@ After:  1 LLM call  × ~3,000 output tokens =  3,000 tokens
 Saving: ~47,000 output tokens = ~$0.70
 """
 
+import hashlib
 import json
 
 from models import Pillar, InternalLink, LinkingPlan, LinkRelationship
@@ -25,23 +26,28 @@ from pydantic import BaseModel
 
 
 # ── Prompt for entity bridges only ───────────────────────────────────────────
+# The full Koray linking prompt (anchor rules, bridge rules, anti-patterns)
+# lives in prompts/internal_linking.txt. Hierarchy links are generated
+# deterministically in this module, so the LLM is scoped to bridges only.
 
-ENTITY_BRIDGE_PROMPT = """You are a semantic SEO strategist.
+_BRIDGE_ADDENDUM = """
 
-Your task: given a topical map, generate ENTITY BRIDGE links.
+# THIS RUN — ENTITY BRIDGES ONLY
 
-An entity bridge is a cross-pillar link where a CLUSTER links to a DIFFERENT PILLAR because they share a key entity.
+The hierarchy links (pillar↔cluster, cluster↔supplementary, homepage) are
+generated deterministically outside of this call. Your ONLY job here is the
+ENTITY_BRIDGE links, following all anchor-text and bridge rules above.
 
-MANDATORY RULES:
-- You MUST generate at least 2 bridges per pillar — this is required, not optional
-- Each bridge: from a cluster_id to a different pillar_id
-- Shared entity: name the specific entity connecting them (e.g. WooCommerce, Elementor, Core Web Vitals)
-- Anchor text: 3-6 natural words
-- Reasoning: max 8 words naming the shared entity
-- relationship_strength: decimal 0.0-1.0 (e.g. 0.85), NOT text like strong
-
-If pillars share ANY common entity, technology, or topic — create a bridge.
-Do NOT return an empty links array. Always generate bridges.
+MANDATORY:
+- Generate at least 2 bridges per pillar — required, not optional.
+- Each bridge: from_page_id is a cluster_id, to_page_id is a DIFFERENT pillar_id.
+- reasoning: max 8 words, naming the shared entity.
+- relationship_strength: decimal 0.0-1.0 (e.g. 0.85), NEVER text like "strong".
+    0.90-1.00 = direct entity overlap (WooCommerce → WooCommerce)
+    0.70-0.89 = strong contextual overlap (Speed → Core Web Vitals)
+    0.50-0.69 = moderate semantic connection (Security → Maintenance)
+    0.30-0.49 = weak but valid connection (Development → Local Business)
+- Do NOT return an empty links array.
 
 Output ONLY valid JSON:
 {
@@ -55,14 +61,11 @@ Output ONLY valid JSON:
       "relationship_strength": 0.92
     }
   ]
-}
+}"""
 
-relationship_strength scoring:
-  0.90-1.00 = direct entity overlap (same core entity, e.g. WooCommerce → WooCommerce)
-  0.70-0.89 = strong contextual overlap (e.g. Speed → Core Web Vitals)
-  0.50-0.69 = moderate semantic connection (e.g. Security → Maintenance)
-  0.30-0.49 = weak but valid connection (e.g. Development → Local Business)
-"""
+
+def _bridge_system_prompt() -> str:
+    return load_prompt("internal_linking") + _BRIDGE_ADDENDUM
 
 
 class _BridgeResponse(BaseModel):
@@ -70,6 +73,34 @@ class _BridgeResponse(BaseModel):
 
 
 # ── Deterministic link generators ─────────────────────────────────────────────
+
+# Anchor templates per direction. Rotating templates (seeded by a stable hash
+# of the from/to pair) avoids the "always use the destination title as anchor"
+# over-optimization anti-pattern that the linking prompt itself forbids —
+# while staying deterministic across runs.
+
+_ANCHOR_TEMPLATES_DOWN = [          # parent → child
+    "{title}",
+    "our guide to {title_lower}",
+    "learn about {title_lower}",
+    "see {title_lower} in detail",
+]
+
+_ANCHOR_TEMPLATES_UP = [            # child → parent
+    "{title}",
+    "our {title_lower}",
+    "explore {title_lower}",
+    "back to {title_lower}",
+]
+
+
+def _vary_anchor(from_id: str, to_id: str, title: str, templates: list[str]) -> str:
+    """Pick a stable anchor variation for this specific edge."""
+    digest = hashlib.md5(f"{from_id}->{to_id}".encode("utf-8")).digest()
+    template = templates[digest[0] % len(templates)]
+    anchor = template.format(title=title, title_lower=title[:1].lower() + title[1:])
+    return anchor[:70]
+
 
 def _pillar_cluster_links(pillars: list[Pillar]) -> list[InternalLink]:
     """Every pillar links to all its clusters and back. Rule-based, zero tokens."""
@@ -80,7 +111,7 @@ def _pillar_cluster_links(pillars: list[Pillar]) -> list[InternalLink]:
             links.append(InternalLink(
                 from_page_id=pillar.id,
                 to_page_id=cluster.id,
-                anchor_text=cluster.title[:55],
+                anchor_text=_vary_anchor(pillar.id, cluster.id, cluster.title, _ANCHOR_TEMPLATES_DOWN),
                 relationship=LinkRelationship.PILLAR_TO_CLUSTER,
                 reasoning="Pillar to cluster.",
             ))
@@ -88,7 +119,7 @@ def _pillar_cluster_links(pillars: list[Pillar]) -> list[InternalLink]:
             links.append(InternalLink(
                 from_page_id=cluster.id,
                 to_page_id=pillar.id,
-                anchor_text=pillar.title[:55],
+                anchor_text=_vary_anchor(cluster.id, pillar.id, pillar.title, _ANCHOR_TEMPLATES_UP),
                 relationship=LinkRelationship.CLUSTER_TO_PILLAR,
                 reasoning="Cluster to parent pillar.",
             ))
@@ -104,14 +135,14 @@ def _supplementary_links(pillars: list[Pillar]) -> list[InternalLink]:
                 links.append(InternalLink(
                     from_page_id=cluster.id,
                     to_page_id=node.id,
-                    anchor_text=node.title[:55],
+                    anchor_text=_vary_anchor(cluster.id, node.id, node.title, _ANCHOR_TEMPLATES_DOWN),
                     relationship=LinkRelationship.CLUSTER_TO_SUPPLEMENTARY,
                     reasoning="Cluster to supplementary.",
                 ))
                 links.append(InternalLink(
                     from_page_id=node.id,
                     to_page_id=cluster.id,
-                    anchor_text=cluster.title[:55],
+                    anchor_text=_vary_anchor(node.id, cluster.id, cluster.title, _ANCHOR_TEMPLATES_UP),
                     relationship=LinkRelationship.SUPPLEMENTARY_TO_CLUSTER,
                     reasoning="Supplementary to parent cluster.",
                 ))
@@ -161,10 +192,11 @@ Output ONLY valid JSON."""
 
     try:
         response = call_anthropic_structured(
-            system_prompt=ENTITY_BRIDGE_PROMPT,
+            system_prompt=_bridge_system_prompt(),
             user_message=user_message,
             response_model=_BridgeResponse,
             max_tokens=4000,
+            stage="Stage 7 — Entity bridges",
         )
         # Validate: every bridge must reference real cluster→different pillar
         valid_cluster_ids = {c.id for p in pillars for c in p.clusters}

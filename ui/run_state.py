@@ -20,6 +20,7 @@ is within 120 seconds, we auto-resume. Past that, the user is asked.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from datetime import datetime, timezone
@@ -32,6 +33,16 @@ from models import SeedInput
 RUNS_DIR = Path("runs")
 GRACE_WINDOW_SECONDS = 120          # 2 minutes — auto-resume window
 STALE_AFTER_SECONDS = 24 * 3600     # 24 hours — runs older than this are pruned
+
+# run_ids are minted by new_run_id() and must match this shape. The id also
+# arrives from the URL query string (?run=...), so this pattern is a security
+# boundary: it prevents path traversal (e.g. ?run=../../etc) from reaching
+# the filesystem helpers below (including shutil.rmtree in delete_run).
+RUN_ID_RE = re.compile(r"^\d{8}_\d{6}_[a-z0-9_]{1,40}$")
+
+
+def is_valid_run_id(run_id: str) -> bool:
+    return bool(run_id) and bool(RUN_ID_RE.fullmatch(run_id))
 
 # Canonical stage order — pipeline must follow this sequence
 STAGE_ORDER = [
@@ -60,21 +71,39 @@ def new_run_id(seed_keyword: str) -> str:
 
 
 def run_dir(run_id: str) -> Path:
+    # Defense in depth: never build a path from an id that could traverse
+    # outside RUNS_DIR (ids reach this function from URL query params).
+    if not is_valid_run_id(run_id):
+        raise ValueError(f"Invalid run_id: {run_id!r}")
     return RUNS_DIR / run_id
 
 
 def run_exists(run_id: str) -> bool:
+    if not is_valid_run_id(run_id):
+        return False
     return run_dir(run_id).exists()
+
+
+# ── Atomic write helper ───────────────────────────────────────────────────────
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """
+    Write via temp-file + os.replace so a crash mid-write can never leave a
+    half-written (corrupt) JSON file behind. Corrupt checkpoints previously
+    made resume crash with a TypeError.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # ── Seed + settings persistence ──────────────────────────────────────────────
 
 def save_seed(run_id: str, seed: SeedInput) -> None:
-    d = run_dir(run_id)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "seed.json").write_text(
+    _atomic_write_text(
+        run_dir(run_id) / "seed.json",
         json.dumps(seed.model_dump(mode="json"), indent=2),
-        encoding="utf-8",
     )
 
 
@@ -90,9 +119,7 @@ def load_seed(run_id: str) -> Optional[SeedInput]:
 
 
 def save_settings(run_id: str, settings: dict) -> None:
-    d = run_dir(run_id)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "settings.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    _atomic_write_text(run_dir(run_id) / "settings.json", json.dumps(settings, indent=2))
 
 
 def load_settings(run_id: str) -> dict:
@@ -138,9 +165,7 @@ def read_progress(run_id: str) -> Optional[dict]:
 
 
 def _write_progress(run_id: str, progress: dict) -> None:
-    d = run_dir(run_id)
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "progress.json").write_text(json.dumps(progress, indent=2), encoding="utf-8")
+    _atomic_write_text(run_dir(run_id) / "progress.json", json.dumps(progress, indent=2))
 
 
 def mark_stage_complete(run_id: str, stage: str, message: str = "") -> None:
@@ -194,7 +219,11 @@ def _seconds_since(iso_ts: str) -> float:
 
 
 def is_within_grace(run_id: str, grace_seconds: int = GRACE_WINDOW_SECONDS) -> bool:
-    """True if the run was updated within the grace window (default 2 min)."""
+    """
+    True if the run was updated within the grace window. Kept for callers
+    that want to *display* how fresh a run is, but `run_status` no longer
+    uses it — resume is always allowed regardless of age.
+    """
     progress = read_progress(run_id)
     if not progress:
         return False
@@ -204,7 +233,14 @@ def is_within_grace(run_id: str, grace_seconds: int = GRACE_WINDOW_SECONDS) -> b
 
 
 def run_status(run_id: str) -> str:
-    """Returns one of: 'missing', 'running_active', 'running_stale', 'completed', 'failed'."""
+    """
+    Returns one of: 'missing', 'running', 'completed', 'failed'.
+
+    There is no time limit on resume. A run that hasn't heartbeated in
+    hours or days still reports 'running' — the caller is expected to
+    check whether a worker thread is alive in *this* process and
+    re-spawn it if not.
+    """
     progress = read_progress(run_id)
     if not progress:
         return "missing"
@@ -213,9 +249,7 @@ def run_status(run_id: str) -> str:
         return "completed"
     if status == "failed":
         return "failed"
-    if is_within_grace(run_id):
-        return "running_active"
-    return "running_stale"
+    return "running"
 
 
 def next_stage_to_run(run_id: str) -> Optional[str]:
@@ -251,11 +285,9 @@ def read_checkpoint(run_id: str, stage: str) -> Optional[dict]:
 
 
 def write_checkpoint(run_id: str, stage: str, data: dict) -> None:
-    d = run_dir(run_id)
-    d.mkdir(parents=True, exist_ok=True)
-    checkpoint_path(run_id, stage).write_text(
+    _atomic_write_text(
+        checkpoint_path(run_id, stage),
         json.dumps(data, indent=2, default=str),
-        encoding="utf-8",
     )
 
 
@@ -267,7 +299,7 @@ def list_active_runs() -> list[dict]:
         return []
     runs = []
     for d in RUNS_DIR.iterdir():
-        if not d.is_dir():
+        if not d.is_dir() or not is_valid_run_id(d.name):
             continue
         progress = read_progress(d.name)
         if not progress:
@@ -303,7 +335,7 @@ def prune_stale_runs(max_age_seconds: int = STALE_AFTER_SECONDS) -> int:
         return 0
     removed = 0
     for d in RUNS_DIR.iterdir():
-        if not d.is_dir():
+        if not d.is_dir() or not is_valid_run_id(d.name):
             continue
         progress = read_progress(d.name)
         if not progress:

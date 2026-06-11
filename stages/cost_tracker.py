@@ -1,25 +1,33 @@
 """
-Cost Tracker for Topical Map Engine v1.5
+Cost Tracker for BriefMap
 
 Tracks token usage and calculates cost for every API call.
 Supports Anthropic Claude and Gemini models.
 
-Usage:
-    from stages.cost_tracker import tracker
+Per-run tracking:
+    Each pipeline run creates its own CostTracker and installs it with
+    use_tracker(). Stage code calls current_tracker() — concurrent runs
+    (multiple Streamlit users / threads) no longer intermix their costs,
+    and reset() of one run cannot wipe another run's data.
 
-    # After pipeline run:
-    tracker.print_report()
-    tracker.save_report("output/cost_report.json")
+Usage:
+    from stages.cost_tracker import CostTracker, use_tracker, current_tracker
+
+    run_tracker = CostTracker()
+    use_tracker(run_tracker)          # at the start of the worker thread
+    ...
+    run_tracker.print_report()
+    run_tracker.save_report("output/cost_report.json")
 """
 
+import contextvars
 import json
-import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 
-# ── Pricing per 1M tokens (May 2026) ─────────────────────────────────────────
+# ── Pricing per 1M tokens (June 2026) ────────────────────────────────────────
 
 PRICING = {
     # Anthropic
@@ -31,18 +39,18 @@ PRICING = {
         "input":  0.80,
         "output": 4.00,
     },
-    # Gemini
+    # Gemini (1.5 family is retired — do not use)
+    "gemini-2.5-flash": {
+        "input":  0.15,
+        "output": 0.60,
+    },
+    "gemini-2.5-pro": {
+        "input":  1.25,
+        "output": 10.00,
+    },
     "gemini-2.0-flash": {
         "input":  0.10,   # Free tier available; paid is ~$0.10/1M
         "output": 0.40,
-    },
-    "gemini-1.5-flash": {
-        "input":  0.075,
-        "output": 0.30,
-    },
-    "gemini-1.5-pro": {
-        "input":  1.25,
-        "output": 5.00,
     },
     # Serper.dev
     "serper": {
@@ -97,11 +105,8 @@ def calculate_serper_cost(num_calls: int, on_paid_plan: bool = False) -> float:
 
 class CostTracker:
     """
-    Singleton tracker. Import and use anywhere in the pipeline.
-
-    Example:
-        from stages.cost_tracker import tracker
-        tracker.log_llm_call("Stage 5", "claude-sonnet-4-6", 2000, 3000)
+    Cost tracker. One instance per pipeline run (see use_tracker /
+    current_tracker at the bottom of this module).
     """
 
     def __init__(self):
@@ -214,7 +219,7 @@ class CostTracker:
         sep = "=" * 60
 
         print(f"\n{sep}")
-        print("  TOPICAL MAP ENGINE — COST REPORT")
+        print("  BRIEFMAP — COST REPORT")
         print(f"  Run started: {self.run_start}")
         print(sep)
 
@@ -307,10 +312,26 @@ class CostTracker:
                 for c in self.serper_calls
             ],
         }
-        Path(path).write_text(json.dumps(report, indent=2))
+        Path(path).write_text(json.dumps(report, indent=2), encoding="utf-8")
         print(f"Cost report saved: {path}")
 
 
-# ── Singleton instance ────────────────────────────────────────────────────────
+# ── Per-run tracker management ────────────────────────────────────────────────
 
+# Global default tracker — used when no per-run tracker is installed
+# (e.g. ad-hoc brief generation outside a pipeline run).
 tracker = CostTracker()
+
+_current_tracker: contextvars.ContextVar[CostTracker | None] = contextvars.ContextVar(
+    "briefmap_cost_tracker", default=None
+)
+
+
+def use_tracker(t: CostTracker) -> None:
+    """Install a tracker for the current thread/context (call at run start)."""
+    _current_tracker.set(t)
+
+
+def current_tracker() -> CostTracker:
+    """Return the tracker for this context, falling back to the global one."""
+    return _current_tracker.get() or tracker

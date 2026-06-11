@@ -175,7 +175,7 @@ def _render_export(output, output_dir):
     if json_path.exists():
         st.download_button(
             label="📥 topical_map.json",
-            data=json_path.read_text(),
+            data=json_path.read_text(encoding="utf-8"),
             file_name="topical_map.json",
             mime="application/json",
         )
@@ -185,7 +185,7 @@ def _render_export(output, output_dir):
     if md_path.exists():
         st.download_button(
             label="📄 topical_map_report.md",
-            data=md_path.read_text(),
+            data=md_path.read_text(encoding="utf-8"),
             file_name="topical_map_report.md",
             mime="text/markdown",
         )
@@ -216,7 +216,7 @@ def _render_export(output, output_dir):
     # Cost report
     cost_path = out_path / "cost_report.json"
     if cost_path.exists():
-        cost_data = json.loads(cost_path.read_text())
+        cost_data = json.loads(cost_path.read_text(encoding="utf-8"))
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("### Cost Report")
         summary = cost_data.get("summary", {})
@@ -230,7 +230,7 @@ def _render_export(output, output_dir):
 
         st.download_button(
             label="📊 cost_report.json",
-            data=cost_path.read_text(),
+            data=cost_path.read_text(encoding="utf-8"),
             file_name="cost_report.json",
             mime="application/json",
         )

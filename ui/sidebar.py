@@ -5,6 +5,8 @@ Shows all saved sessions with quick-load buttons.
 Rendered on every page via app.py.
 """
 
+import html
+
 import streamlit as st
 from pathlib import Path
 
@@ -50,9 +52,9 @@ def render_sidebar():
                     f"border-radius:8px; padding:0.7rem; margin-bottom:0.5rem;'>"
                     f"<div style='font-size:0.85rem; font-weight:500; color:#e8e8f0; "
                     f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis;'>"
-                    f"{seed[:35]}</div>"
+                    f"{html.escape(seed[:35])}</div>"
                     f"<div style='font-size:0.72rem; color:#6b6b8a; margin-top:0.2rem;'>"
-                    f"{created} · {pillars}P · {clusters}C</div>"
+                    f"{html.escape(str(created))} · {pillars}P · {clusters}C</div>"
                     f"</div>",
                     unsafe_allow_html=True,
                 )

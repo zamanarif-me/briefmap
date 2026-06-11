@@ -34,4 +34,5 @@ Output the JSON object as specified in the schema. No preamble."""
         system_prompt=system_prompt,
         user_message=user_message,
         response_model=CentralEntity,
+        stage="Stage 2 — Central entity",
     )

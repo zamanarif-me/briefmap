@@ -1,5 +1,5 @@
 """
-Data model for the Topical Map Engine.
+Data model for BriefMap.
 
 Every stage of the pipeline produces or consumes these objects.
 The JSON serialization is what gets passed between stages and ultimately

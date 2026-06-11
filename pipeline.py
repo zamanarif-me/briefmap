@@ -1,9 +1,9 @@
 """
-Top-level pipeline — v1.6 (Resumable: Anthropic + Gemini + Serper)
+BriefMap — top-level pipeline (Resumable: Anthropic + Gemini + Serper)
 
 Stage assignments:
   Anthropic Sonnet → Stages 2, 3, 5, 7  (quality-critical reasoning)
-  Gemini Flash     → Stages 4, 6        (validation, supplementary — cost saving)
+  Gemini Flash     → Stages 4, 6        (validation fallback, supplementary — cost saving)
   Serper.dev       → Stage 3.5          (SERP + PAA + competitor data)
 
 Resumability:
@@ -48,14 +48,14 @@ from models import (
 from stages.intake import load_intake_from_json
 from stages.central_entity import extract_central_entity
 from stages.expansion import expand_topics
-from stages.serp import pull_serp_for_pillars, SerpData, OrganicResult
+from stages.serp import pull_serp_for_pillars, save_serp_data, SerpData, OrganicResult
 from stages.validation import validate_topics
 from stages.queries import generate_queries_for_all
 from stages.tiering import generate_supplementary_for_all
 from stages.linking import build_linking_plan
 from stages.geo import derive_geo_pages
 from stages.render import save_outputs
-from stages.cost_tracker import tracker
+from stages.cost_tracker import CostTracker, use_tracker
 
 
 def _log(msg: str):
@@ -148,13 +148,18 @@ def run_pipeline(
     if run_state.read_progress(run_id) is None:
         run_state.init_progress(run_id)
 
-    # Cost tracker — reset only on fresh runs, preserve on resume
-    if not run_state.has_checkpoint(run_id, "stage2"):
-        tracker.reset()
+    # Cost tracker — one tracker per run, installed for this thread/context.
+    # Concurrent runs (multiple users) no longer intermix or reset each
+    # other's cost data.
+    run_tracker = CostTracker()
+    use_tracker(run_tracker)
 
     # ── Stage 2: Central Entity (Anthropic) ──────────────────────────────────
-    if run_state.has_checkpoint(run_id, "stage2"):
-        cp = run_state.read_checkpoint(run_id, "stage2")
+    # NOTE on all stages below: read_checkpoint() returns None for a missing
+    # OR corrupt checkpoint file, so a half-written checkpoint (crash mid-
+    # write) re-runs the stage instead of crashing the resume.
+    cp = run_state.read_checkpoint(run_id, "stage2")
+    if cp and "central_entity" in cp:
         central = CentralEntity.model_validate(cp["central_entity"])
         _log(f"Stage 2: SKIPPED (checkpoint found) — {central.primary}")
     else:
@@ -168,8 +173,8 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage2", f"Central entity: {central.primary}")
 
     # ── Stage 3: Topic Expansion (Anthropic) ─────────────────────────────────
-    if run_state.has_checkpoint(run_id, "stage3"):
-        cp = run_state.read_checkpoint(run_id, "stage3")
+    cp = run_state.read_checkpoint(run_id, "stage3")
+    if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
         _log(f"Stage 3: SKIPPED (checkpoint found) — {len(pillars)} pillars")
     else:
@@ -185,18 +190,18 @@ def run_pipeline(
 
     # ── Stage 3.5: SERP Intelligence (Serper.dev) ────────────────────────────
     serp_data: Optional[dict[str, SerpData]] = None
+    cp = None if skip_serp else run_state.read_checkpoint(run_id, "stage3_5")
     if skip_serp:
         _log("Stage 3.5: SKIPPED (skip_serp=True)")
         run_state.mark_stage_complete(run_id, "stage3_5", "SERP skipped by setting")
-    elif run_state.has_checkpoint(run_id, "stage3_5"):
-        cp = run_state.read_checkpoint(run_id, "stage3_5")
+    elif cp:
         serp_data = {pid: _dict_to_serpdata(d) for pid, d in cp.items()}
         _log(f"Stage 3.5: SKIPPED (checkpoint found) — {len(serp_data)} pillars cached")
     else:
         _log("Stage 3.5: pulling SERP data [Serper.dev]...")
         run_state.heartbeat(run_id, "Stage 3.5: pulling SERP data...")
         serp_data = pull_serp_for_pillars(pillars, geo=serp_geo, lang=serp_lang)
-        tracker.log_serper_call("Stage 3.5 — Serper.dev", len(pillars))
+        run_tracker.log_serper_call("Stage 3.5 — Serper.dev", len(pillars))
         total_paa     = sum(len(s.paa) for s in serp_data.values())
         total_related = sum(len(s.related_searches) for s in serp_data.values())
         _log(f"  PAA questions: {total_paa} | Related searches: {total_related}")
@@ -205,12 +210,20 @@ def run_pipeline(
         })
         run_state.mark_stage_complete(run_id, "stage3_5", f"{total_paa} PAA, {total_related} related")
 
+    # Persist SERP data alongside the outputs so Stage 9 (content briefs)
+    # can ground itself in real PAA / competitor data later.
+    if serp_data:
+        try:
+            save_serp_data(serp_data, output_dir / "serp_data.json")
+        except Exception as e:
+            _log(f"  WARNING: could not persist serp_data.json: {e}")
+
     # ── Stage 4: Validation ──────────────────────────────────────────────────
+    cp = None if skip_validation else run_state.read_checkpoint(run_id, "stage4")
     if skip_validation:
         _log("Stage 4: SKIPPED (skip_validation=True)")
         run_state.mark_stage_complete(run_id, "stage4", "Validation skipped by setting")
-    elif run_state.has_checkpoint(run_id, "stage4"):
-        cp = run_state.read_checkpoint(run_id, "stage4")
+    elif cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
         _log("Stage 4: SKIPPED (checkpoint found)")
     else:
@@ -238,8 +251,8 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage4", f"strong:{strong} medium:{medium} weak:{weak}")
 
     # ── Stage 5: Query Generation (Anthropic + Serper PAA) ───────────────────
-    if run_state.has_checkpoint(run_id, "stage5"):
-        cp = run_state.read_checkpoint(run_id, "stage5")
+    cp = run_state.read_checkpoint(run_id, "stage5")
+    if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
         total_queries = sum(
             len(p.representative_queries) + sum(len(c.represented_queries) for c in p.clusters)
@@ -261,8 +274,8 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage5", f"{total_queries} queries generated")
 
     # ── Stage 6: Supplementary Nodes (Gemini Flash + Serper related) ─────────
-    if run_state.has_checkpoint(run_id, "stage6"):
-        cp = run_state.read_checkpoint(run_id, "stage6")
+    cp = run_state.read_checkpoint(run_id, "stage6")
+    if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
         total_supp = sum(
             sum(len(c.supplementary_nodes) for c in p.clusters)
@@ -295,8 +308,8 @@ def run_pipeline(
     )
 
     # ── Stage 7: Internal Linking (Anthropic) ────────────────────────────────
-    if run_state.has_checkpoint(run_id, "stage7"):
-        cp = run_state.read_checkpoint(run_id, "stage7")
+    cp = run_state.read_checkpoint(run_id, "stage7")
+    if cp and "linking_plan" in cp:
         linking_plan = LinkingPlan.model_validate(cp["linking_plan"])
         _log(f"Stage 7: SKIPPED (checkpoint found) — {len(linking_plan.links)} links")
     else:
@@ -316,7 +329,7 @@ def run_pipeline(
     )
 
     # ── Stage 8: Render ──────────────────────────────────────────────────────
-    if run_state.has_checkpoint(run_id, "stage8"):
+    if run_state.read_checkpoint(run_id, "stage8") is not None:
         _log("Stage 8: SKIPPED (checkpoint found) — outputs already rendered")
     else:
         _log("Stage 8: rendering JSON + Markdown report...")
@@ -330,21 +343,28 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage8", "Outputs rendered")
 
     _log("Pipeline complete.")
-    tracker.print_report()
-    tracker.save_report(output_dir / "cost_report.json")
+    run_tracker.print_report()
+    run_tracker.save_report(output_dir / "cost_report.json")
 
     # ── Auto-save session (Session History sidebar) ──────────────────────────
     try:
         from ui.session_manager import save_session
         save_session(final_output, run_id)
         _log(f"Session saved: {run_id}")
-        final_output._session_id = run_id
     except Exception as e:
         _log(f"Session save skipped: {e}")
 
-    # Mark the run as fully completed in run_state
+    # Attach run metadata BEFORE marking the run completed, so a failure
+    # here cannot flip an already-completed run to "failed".
+    try:
+        final_output._session_id = run_id
+        final_output._run_id = run_id
+    except Exception:
+        pass
+
+    # Mark the run as fully completed in run_state — last, nothing after this
+    # can raise.
     run_state.mark_run_completed(run_id, "Pipeline complete")
-    final_output._run_id = run_id
 
     return final_output
 
