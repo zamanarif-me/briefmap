@@ -51,7 +51,7 @@ from stages.expansion import expand_topics
 from stages.serp import pull_serp_for_pillars, save_serp_data, SerpData, OrganicResult
 from stages.validation import validate_topics
 from stages.queries import generate_queries_for_all
-from stages.tiering import generate_supplementary_for_all
+from stages.tiering import generate_supplementary_for_all, is_fallback_node
 from stages.linking import build_linking_plan
 from stages.geo import derive_geo_pages
 from stages.render import save_outputs
@@ -290,11 +290,22 @@ def run_pipeline(
             sum(len(c.supplementary_nodes) for c in p.clusters)
             for p in pillars
         )
+        fallback_supp = sum(
+            sum(1 for c in p.clusters for n in c.supplementary_nodes if is_fallback_node(n))
+            for p in pillars
+        )
         _log(f"  {total_supp} supplementary nodes")
+        supp_msg = f"{total_supp} supplementary nodes"
+        if fallback_supp:
+            pct = round(100 * fallback_supp / max(total_supp, 1))
+            _log(f"  WARNING: {fallback_supp}/{total_supp} ({pct}%) are deterministic "
+                 f"fallback placeholders — the LLM call failed for those clusters. "
+                 f"They are flagged in the CSV/report; regenerate before delivering.")
+            supp_msg += f" ({fallback_supp} FALLBACK placeholders — regenerate)"
         run_state.write_checkpoint(run_id, "stage6", {
             "pillars": [p.model_dump(mode="json") for p in pillars],
         })
-        run_state.mark_stage_complete(run_id, "stage6", f"{total_supp} supplementary nodes")
+        run_state.mark_stage_complete(run_id, "stage6", supp_msg)
 
     # ── Geo pages (deterministic, fast — no checkpoint needed) ───────────────
     _log("Deriving geographic service pages...")

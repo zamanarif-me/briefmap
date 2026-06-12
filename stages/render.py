@@ -203,6 +203,10 @@ def render_koray_csv(output: EngineOutput) -> str:
 
             for node in cluster.supplementary_nodes:
                 angle = f"[{node.angle}] " if node.angle else ""
+                # Flag deterministic-fallback nodes so they are visible in
+                # the deliverable — a client should never receive template
+                # placeholders presented as generated content.
+                is_fallback = bool(node.rationale and "fallback" in node.rationale.lower())
                 writer.writerow([
                     node.title,
                     "h3",
@@ -210,7 +214,7 @@ def render_koray_csv(output: EngineOutput) -> str:
                     f"{angle}{node.funnel_stage.value}",
                     "",
                     source_context,
-                    "",
+                    "FALLBACK PLACEHOLDER — regenerate before publishing" if is_fallback else "",
                 ])
 
         # ── Entity-bridge rows for this pillar ────────────────────────────────

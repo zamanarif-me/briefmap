@@ -55,6 +55,36 @@ def _supp_system_prompt() -> str:
     return load_prompt("supplementary") + _SUPP_ADDENDUM
 
 
+# ── Angle normalization ───────────────────────────────────────────────────────
+# LLMs label the same four canonical angles with synonyms ("perspective_diversity",
+# "lifecycle_state_transition", "myth_busting"...). Without normalization the
+# minimum-enforcement logic sees "perspective" as missing next to
+# "perspective_diversity" and appends a near-duplicate fallback node — the
+# Tree Removal map shipped 23 junk duplicates exactly this way.
+
+_ANGLE_SYNONYMS = {
+    "contradiction":              "contradiction",
+    "myth_busting":               "contradiction",
+    "myth-busting":               "contradiction",
+    "information_gain":           "information_gain",
+    "information-gain":           "information_gain",
+    "rare_attribute":             "information_gain",
+    "perspective":                "perspective",
+    "perspective_diversity":      "perspective",
+    "stakeholder_perspective":    "perspective",
+    "lifecycle":                  "lifecycle",
+    "lifecycle_state_transition": "lifecycle",
+    "state_transition":           "lifecycle",
+}
+
+
+def _normalize_angle(angle: Optional[str]) -> Optional[str]:
+    if not angle:
+        return angle
+    key = angle.strip().lower().replace(" ", "_")
+    return _ANGLE_SYNONYMS.get(key, key)
+
+
 # ── ID matcher ────────────────────────────────────────────────────────────────
 
 def _resolve_cluster_id(
@@ -93,40 +123,63 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len]
 
 
+FALLBACK_RATIONALE = "Deterministic fallback (LLM did not return a node for this cluster) — REGENERATE before publishing."
+
+
+def is_fallback_node(node: SupplementaryNode) -> bool:
+    """True when a supplementary node came from the deterministic fallback."""
+    return bool(node.rationale and "fallback" in node.rationale.lower())
+
+
+def _fallback_base(cluster_title: str) -> str:
+    """
+    Title-safe base for fallback templates: drop a ': subtitle' tail and
+    trailing punctuation so wrapped titles stay grammatical (the old
+    templates produced things like 'How How to Prevent ... Actually
+    Affects Site Performance').
+    """
+    return cluster_title.split(":")[0].strip().rstrip(".")
+
+
 def _fallback_nodes_for_cluster(cluster: Cluster, pillar: Pillar) -> list[SupplementaryNode]:
-    """Generate 4 deterministic supplementary nodes when LLM output is missing for a cluster."""
-    base = cluster.title.rstrip(".")
+    """
+    Generate deterministic supplementary nodes when LLM output is missing
+    for a cluster. Templates are DOMAIN-NEUTRAL — the previous set was
+    written for WordPress ('Affects Site Performance', 'Site Owner') and
+    leaked that vocabulary into every non-WordPress map.
+    """
+    base = _fallback_base(cluster.title)
     pillar_slug = _slugify(pillar.title, 20)
     cluster_slug = _slugify(cluster.title, 20)
 
     templates = [
         (
-            f"Why Common Advice About {base} Is Incomplete",
+            f"Why Common Advice About {base} Is Often Wrong",
             "contradiction",
             FunnelStage.MOFU,
             Intent.INFORMATIONAL,
             "myth",
         ),
         (
-            f"How {base} Actually Affects Site Performance",
+            f"Lesser-Known Factors That Affect {base}",
             "information_gain",
             FunnelStage.MOFU,
             Intent.INFORMATIONAL,
             "mechanism",
         ),
         (
-            f"{base} from a Site Owner's Perspective",
+            f"{base}: What First-Time Customers Need to Know",
             "perspective",
             FunnelStage.TOFU,
             Intent.INFORMATIONAL,
             "perspective",
         ),
         (
-            f"Troubleshooting {base} After Launch",
+            f"{base}: Long-Term Maintenance and Follow-Up",
             "lifecycle",
             FunnelStage.MOFU,
             Intent.INFORMATIONAL,
-            "troubleshoot",
+            "followup",
         ),
     ]
 
@@ -139,29 +192,44 @@ def _fallback_nodes_for_cluster(cluster: Cluster, pillar: Pillar) -> list[Supple
             intent=intent,
             funnel_stage=fs,
             angle=angle,
-            rationale="Deterministic fallback (LLM did not return a node for this cluster).",
+            rationale=FALLBACK_RATIONALE,
         ))
     return nodes
 
 
+def _cluster_satisfied(cluster: Cluster) -> bool:
+    """A cluster is satisfied with >= 1 contradiction + >= 1 information_gain + >= 2 total."""
+    angles = {_normalize_angle(n.angle) for n in cluster.supplementary_nodes}
+    return (
+        {"contradiction", "information_gain"}.issubset(angles)
+        and len(cluster.supplementary_nodes) >= 2
+    )
+
+
 def _ensure_minimums(pillar: Pillar) -> None:
-    """Each cluster must have >= 1 contradiction + >= 1 information_gain + >= 2 total."""
+    """
+    Each cluster must have >= 1 contradiction + >= 1 information_gain +
+    >= 2 nodes total. Satisfaction is checked BEFORE appending anything —
+    the old version appended first and checked after, so a cluster that
+    already met every minimum still received one junk fallback node.
+    """
     for cluster in pillar.clusters:
-        existing_angles = {(n.angle or "").lower() for n in cluster.supplementary_nodes}
+        if _cluster_satisfied(cluster):
+            continue
+
+        existing_angles = {_normalize_angle(n.angle) for n in cluster.supplementary_nodes}
         existing_ids = {n.id for n in cluster.supplementary_nodes}
 
         for node in _fallback_nodes_for_cluster(cluster, pillar):
-            if node.angle in existing_angles:
+            if _cluster_satisfied(cluster):
+                break
+            if _normalize_angle(node.angle) in existing_angles:
                 continue
             if node.id in existing_ids:
                 continue
             cluster.supplementary_nodes.append(node)
-            existing_angles.add(node.angle)
+            existing_angles.add(_normalize_angle(node.angle))
             existing_ids.add(node.id)
-            # Stop once cluster has both mandatory angles + at least 2 nodes
-            if {"contradiction", "information_gain"}.issubset(existing_angles) \
-               and len(cluster.supplementary_nodes) >= 2:
-                break
 
 
 # ── Main per-pillar generator ─────────────────────────────────────────────────
@@ -220,7 +288,7 @@ def generate_supplementary_for_pillar(
                 parent_cluster_id=cluster.id,
                 intent=node.intent,
                 funnel_stage=node.funnel_stage,
-                angle=node.angle,
+                angle=_normalize_angle(node.angle),
             ))
             added += 1
         msg = f"    {added} nodes added"

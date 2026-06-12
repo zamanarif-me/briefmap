@@ -76,7 +76,7 @@ Represented queries:
 {% if c.supplementary_nodes -%}
 Supplementary nodes ({{ c.supplementary_nodes | length }}):
 {% for s in c.supplementary_nodes -%}
-- [{{ s.angle | upper if s.angle else "—" }}] {{ s.title }} ({{ s.intent.value }}, {{ s.funnel_stage.value }})
+- [{{ s.angle | upper if s.angle else "—" }}] {{ s.title }} ({{ s.intent.value }}, {{ s.funnel_stage.value }}){% if s.rationale and "fallback" in s.rationale | lower %} ⚠️ **FALLBACK PLACEHOLDER — regenerate**{% endif %}
 {% endfor %}
 {% endif %}
 {% endfor %}
