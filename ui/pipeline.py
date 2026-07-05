@@ -111,11 +111,14 @@ def _spawn_worker(run_id: str, seed, settings: dict) -> None:
         # Do this in both the parent and child threads to be safe.
         _reset_builtin_print()
 
+        # A fresh worker means fresh intent to run — drop any stale cancel flag.
+        run_state.clear_cancel(run_id)
+
         def _target():
             # Background thread — make absolutely sure print is harmless here.
             _reset_builtin_print()
             try:
-                from pipeline import run_pipeline
+                from pipeline import run_pipeline, PipelineCancelled
                 run_pipeline(
                     seed=seed,
                     output_dir=run_state.run_dir(run_id),
@@ -125,6 +128,8 @@ def _spawn_worker(run_id: str, seed, settings: dict) -> None:
                     serp_lang=settings.get("serp_lang", "en"),
                     run_id=run_id,
                 )
+            except PipelineCancelled:
+                run_state.mark_run_failed(run_id, "Cancelled by user")
             except Exception as e:
                 run_state.mark_run_failed(run_id, f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
@@ -147,14 +152,14 @@ STAGE_LABELS = {
 }
 
 
-def _check_api_keys() -> list[str]:
+def _check_api_keys(skip_serp: bool = False) -> list[str]:
     # GEMINI_API_KEY is required too: Stage 6 (supplementary) runs on Gemini
     # Flash, and Stage 4 falls back to Gemini when SERP is skipped.
-    missing = []
-    for key in ["ANTHROPIC_API_KEY", "GEMINI_API_KEY", "SERPER_API_KEY"]:
-        if not os.environ.get(key):
-            missing.append(key)
-    return missing
+    # SERPER_API_KEY is only needed when the SERP pull is enabled.
+    required = ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
+    if not skip_serp:
+        required.append("SERPER_API_KEY")
+    return [key for key in required if not os.environ.get(key)]
 
 
 def _load_completed_output(run_id: str):
@@ -230,8 +235,14 @@ def _render_progress_panel(progress: dict, run_id: str) -> None:
 def render_pipeline():
     st.markdown("## 🔄 Generating Topical Map")
 
-    # API key check
-    missing_keys = _check_api_keys()
+    # API key check — respect the skip_serp setting (from the intake form or,
+    # on resume, from the run's saved settings).
+    _run_id_for_settings = st.session_state.get("active_run_id")
+    _settings = st.session_state.get("pipeline_settings")
+    if _settings is None and _run_id_for_settings:
+        _settings = run_state.load_settings(_run_id_for_settings)
+    _settings = _settings or {}
+    missing_keys = _check_api_keys(skip_serp=_settings.get("skip_serp", False))
     if missing_keys:
         st.error(f"Missing API keys: {', '.join(missing_keys)}")
         st.info("Set them in your environment or a `.env` file before running.")
@@ -352,15 +363,25 @@ def render_pipeline():
     # ── State: running ───────────────────────────────────────────────────────
     # No time limit on resume. If the worker thread is gone (e.g. process
     # restart, network drop that killed the script, or a silent crash),
-    # we re-spawn it automatically from the last completed checkpoint.
+    # we re-spawn it automatically from the last completed checkpoint —
+    # unless a cancel is pending (respawning would clear the cancel flag).
+    cancel_pending = run_state.cancel_requested(run_id)
     worker_was_dead = not _worker_alive(run_id)
-    if worker_was_dead:
+    if worker_was_dead and not cancel_pending:
         seed = run_state.load_seed(run_id)
         settings = run_state.load_settings(run_id)
         if seed:
             run_state.heartbeat(run_id, "Auto-resuming from last checkpoint...")
             _spawn_worker(run_id, seed, settings)
             progress = run_state.read_progress(run_id) or progress
+
+    if cancel_pending:
+        if worker_was_dead:
+            # Worker already gone — finalize the cancellation ourselves.
+            run_state.clear_cancel(run_id)
+            run_state.mark_run_failed(run_id, "Cancelled by user")
+            st.rerun()
+        st.info("⏹ Cancel requested — the worker will stop after the current stage finishes.")
 
     # Surface how long since the worker last reported progress. Purely
     # informational — does NOT gate resume.
@@ -390,19 +411,34 @@ def render_pipeline():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄  Force restart worker", use_container_width=True,
-                     help="Kill the current heartbeat and re-spawn the worker thread"):
-            seed = run_state.load_seed(run_id)
-            settings = run_state.load_settings(run_id)
-            if seed:
-                # Drop the cached thread entry so _spawn_worker will start a fresh one
-                with _WORKER_LOCK:
-                    _WORKERS.pop(run_id, None)
-                run_state.heartbeat(run_id, "Force-restarting worker...")
-                _spawn_worker(run_id, seed, settings)
-            st.rerun()
+                     help="Re-spawn the worker thread once the current one has stopped"):
+            # Threads can't be killed. Spawning a second worker while the old
+            # one is alive would run two pipelines on the same run dir, so:
+            # if the old worker is alive, request cancel and wait; only spawn
+            # once it's actually gone.
+            if _worker_alive(run_id):
+                run_state.request_cancel(run_id)
+                run_state.heartbeat(run_id, "Stopping current worker before restart...")
+                st.info("Current worker is still running — it will stop at the next "
+                        "stage boundary. Click Force restart again once it has stopped.")
+            else:
+                seed = run_state.load_seed(run_id)
+                settings = run_state.load_settings(run_id)
+                if seed:
+                    with _WORKER_LOCK:
+                        _WORKERS.pop(run_id, None)
+                    run_state.heartbeat(run_id, "Force-restarting worker...")
+                    _spawn_worker(run_id, seed, settings)
+                st.rerun()
     with col2:
         if st.button("⏹  Stop run", use_container_width=True):
-            run_state.mark_run_failed(run_id, "Cancelled by user")
+            if _worker_alive(run_id):
+                # Cooperative cancel: the pipeline checks the flag between
+                # stages, marks the run failed, and stops spending API money.
+                run_state.request_cancel(run_id)
+                run_state.heartbeat(run_id, "Cancel requested...")
+            else:
+                run_state.mark_run_failed(run_id, "Cancelled by user")
             st.rerun()
 
     # Poll: rerun after 2s to refresh progress

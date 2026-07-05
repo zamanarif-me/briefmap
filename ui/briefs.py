@@ -97,6 +97,19 @@ def render_briefs():
     output_dir = st.session_state.get("output_dir", "streamlit_output")
 
     if not output:
+        # Reconnect fallback — reload from disk via the run id in the URL.
+        try:
+            from ui.results import _restore_output_from_disk
+            output, restored_dir = _restore_output_from_disk()
+            if output:
+                st.session_state.output = output
+                if restored_dir:
+                    st.session_state.output_dir = restored_dir
+                    output_dir = restored_dir
+        except Exception:
+            pass
+
+    if not output:
         st.warning("No topical map found. Generate one first.")
         if st.button("← Back to home"):
             set_page("home")
@@ -152,15 +165,21 @@ def render_briefs():
         )
 
     if max_clusters > 0:
+        # Preview must match the batch's actual processing order
+        # (BOFU-first, strongest signal first) — not raw map order.
+        from stages.brief_batch import ordered_clusters
         st.markdown("**Clusters that will get briefs:**")
-        for c in pillar.clusters[:max_clusters]:
+        for c in ordered_clusters(pillar)[:max_clusters]:
             st.markdown(f"  • {c.title}")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     # ── State management ──────────────────────────────────────────────────────
-    brief_key    = f"brief_state_{pillar.id}_{max_clusters}"
-    package_key  = f"brief_package_{pillar.id}_{max_clusters}"
+    # Keyed by pillar only: including max_clusters meant moving the slider
+    # mid-run orphaned the running job's state and re-enabled Generate,
+    # allowing a duplicate concurrent batch on the same checkpoint dir.
+    brief_key    = f"brief_state_{pillar.id}"
+    package_key  = f"brief_package_{pillar.id}"
 
     # ── Generate button ───────────────────────────────────────────────────────
     col_btn, col_cancel = st.columns([3, 1])
@@ -206,7 +225,13 @@ def render_briefs():
             # Spinning animation + progress
             status = state.get("status", "Working...")
             logs   = state.get("logs", [])
-            done_count = sum(1 for l in logs if "brief done" in l.lower() or "saved:" in l.lower())
+            # Batch log lines for a finished brief are "  Done — ..." or
+            # "  Resumed from checkpoint ..." — count those.
+            done_count = sum(
+                1 for l in logs
+                if l.strip().lower().startswith("done —")
+                or "resumed from checkpoint" in l.lower()
+            )
             total_count = 1 + max_clusters
 
             st.markdown(f"""

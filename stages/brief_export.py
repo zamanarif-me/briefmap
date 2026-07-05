@@ -114,13 +114,25 @@ def _brief_to_row(brief: ContentBrief) -> dict:
     }
 
 
+def _csv_safe(value):
+    """
+    Neutralize Excel formula injection: cells starting with = + - @ (or
+    tab/CR) execute as formulas when the CSV opens in Excel, and every cell
+    here is LLM/SERP-derived. Prefix with an apostrophe.
+    """
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + value
+    return value
+
+
 def briefs_to_csv(briefs: dict[str, ContentBrief]) -> bytes:
     """Render all briefs as a single CSV — one row per brief."""
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for brief in briefs.values():
-        writer.writerow(_brief_to_row(brief))
+        row = {k: _csv_safe(v) for k, v in _brief_to_row(brief).items()}
+        writer.writerow(row)
     return buf.getvalue().encode("utf-8-sig")  # BOM for Excel
 
 

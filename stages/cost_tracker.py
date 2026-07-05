@@ -31,13 +31,17 @@ from pathlib import Path
 
 PRICING = {
     # Anthropic
+    "claude-sonnet-5": {
+        "input":  3.00,   # $3.00 per 1M input tokens ($2.00 intro through 2026-08-31)
+        "output": 15.00,  # $15.00 per 1M output tokens ($10.00 intro)
+    },
     "claude-sonnet-4-6": {
-        "input":  3.00,   # $3.00 per 1M input tokens
-        "output": 15.00,  # $15.00 per 1M output tokens
+        "input":  3.00,
+        "output": 15.00,
     },
     "claude-haiku-4-5": {
-        "input":  0.80,
-        "output": 4.00,
+        "input":  1.00,
+        "output": 5.00,
     },
     # Gemini (1.5 family is retired — do not use)
     "gemini-2.5-flash": {
@@ -68,6 +72,8 @@ class APICall:
     input_tokens: int
     output_tokens: int
     cost_usd: float
+    cache_write_tokens: int = 0   # billed at 1.25x input price (5-min TTL)
+    cache_read_tokens: int = 0    # billed at 0.1x input price
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     notes: str = ""
 
@@ -82,16 +88,31 @@ class SerperCall:
 
 # ── Cost Calculator ───────────────────────────────────────────────────────────
 
-def calculate_llm_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate cost in USD for an LLM call."""
+def calculate_llm_cost(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> float:
+    """
+    Calculate cost in USD for an LLM call.
+
+    Prompt-cache tokens are billed against the input price:
+    writes at 1.25x (5-minute TTL), reads at 0.1x.
+    """
     pricing = PRICING.get(model)
     if not pricing:
         # Unknown model — estimate at Sonnet price
-        pricing = PRICING["claude-sonnet-4-6"]
+        pricing = PRICING["claude-sonnet-5"]
 
     input_cost  = (input_tokens  / 1_000_000) * pricing["input"]
     output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    return round(input_cost + output_cost, 6)
+    cache_cost  = (
+        (cache_write_tokens / 1_000_000) * pricing["input"] * 1.25
+        + (cache_read_tokens / 1_000_000) * pricing["input"] * 0.10
+    )
+    return round(input_cost + output_cost + cache_cost, 6)
 
 
 def calculate_serper_cost(num_calls: int, on_paid_plan: bool = False) -> float:
@@ -127,16 +148,24 @@ class CostTracker:
         model: str,
         input_tokens: int,
         output_tokens: int,
+        cache_write_tokens: int = 0,
+        cache_read_tokens: int = 0,
         notes: str = "",
     ) -> float:
         """Log one LLM API call and return its cost."""
-        cost = calculate_llm_cost(model, input_tokens, output_tokens)
+        cost = calculate_llm_cost(
+            model, input_tokens, output_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
+        )
         self.llm_calls.append(APICall(
             stage=stage,
             model=model,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost,
+            cache_write_tokens=cache_write_tokens,
+            cache_read_tokens=cache_read_tokens,
             notes=notes,
         ))
         return cost
@@ -159,6 +188,14 @@ class CostTracker:
     @property
     def total_output_tokens(self) -> int:
         return sum(c.output_tokens for c in self.llm_calls)
+
+    @property
+    def total_cache_write_tokens(self) -> int:
+        return sum(c.cache_write_tokens for c in self.llm_calls)
+
+    @property
+    def total_cache_read_tokens(self) -> int:
+        return sum(c.cache_read_tokens for c in self.llm_calls)
 
     @property
     def total_llm_cost(self) -> float:
@@ -283,6 +320,8 @@ class CostTracker:
                 "total_llm_calls":     len(self.llm_calls),
                 "total_input_tokens":  self.total_input_tokens,
                 "total_output_tokens": self.total_output_tokens,
+                "total_cache_write_tokens": self.total_cache_write_tokens,
+                "total_cache_read_tokens":  self.total_cache_read_tokens,
                 "total_llm_cost_usd":  self.total_llm_cost,
                 "total_serper_calls":  self.total_serper_calls,
                 "total_serper_cost_usd": self.total_serper_cost,
@@ -296,6 +335,8 @@ class CostTracker:
                     "model":         c.model,
                     "input_tokens":  c.input_tokens,
                     "output_tokens": c.output_tokens,
+                    "cache_write_tokens": c.cache_write_tokens,
+                    "cache_read_tokens":  c.cache_read_tokens,
                     "cost_usd":      c.cost_usd,
                     "timestamp":     c.timestamp,
                     "notes":         c.notes,

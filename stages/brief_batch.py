@@ -130,6 +130,21 @@ def _write_brief_checkpoint(output_dir: Path, page_id: str, brief: ContentBrief)
 _SIGNAL_RANK = {"strong": 0, "medium": 1, None: 2, "weak": 3}
 
 
+def ordered_clusters(pillar: Pillar) -> list:
+    """
+    The order clusters get briefs in: BOFU first, then stronger validation
+    signals first. Exposed so the UI preview shows the same list the batch
+    will actually process.
+    """
+    return sorted(
+        pillar.clusters,
+        key=lambda c: (
+            0 if c.funnel_stage.value == "BOFU" else 1,
+            _SIGNAL_RANK.get(c.validation_signal, 2),
+        ),
+    )
+
+
 def run_batch_for_pillar(
     pillar: Pillar,
     topical_map: TopicalMap,
@@ -193,13 +208,7 @@ def run_batch_for_pillar(
     if include_clusters:
         # BOFU first, then stronger validation signals first — money pages
         # and validated topics get briefs before anything speculative.
-        clusters = sorted(
-            pillar.clusters,
-            key=lambda c: (
-                0 if c.funnel_stage.value == "BOFU" else 1,
-                _SIGNAL_RANK.get(c.validation_signal, 2),
-            ),
-        )
+        clusters = ordered_clusters(pillar)
         if max_clusters is not None:
             clusters = clusters[:max_clusters]
 

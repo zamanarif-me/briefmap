@@ -126,7 +126,21 @@ def render_koray_csv(output: EngineOutput) -> str:
     """
     import csv, io
     out = io.StringIO()
-    writer = csv.writer(out)
+    _raw_writer = csv.writer(out)
+
+    def _csv_safe(value):
+        # Excel executes cells starting with = + - @ (or tab/CR) as formulas.
+        # All cell content here is LLM/SERP-derived, so neutralize with a
+        # leading apostrophe (CSV formula-injection defense).
+        if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@", "\t", "\r"):
+            return "'" + value
+        return value
+
+    class _SafeWriter:
+        def writerow(self, row):
+            _raw_writer.writerow([_csv_safe(cell) for cell in row])
+
+    writer = _SafeWriter()
 
     HEADER = [
         "Contextual Vector",

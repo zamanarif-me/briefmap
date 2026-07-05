@@ -157,6 +157,31 @@ def _homepage_links(pillars: list[Pillar]) -> list[str]:
     ]
 
 
+def _geo_page_links(geo_pages: list) -> list[InternalLink]:
+    """
+    Every geo page links back to its parent pillar and the pillar links out
+    to each of its regional variants. Without these the geo pages are orphans
+    in the link graph — no inbound or outbound links at all.
+    """
+    links: list[InternalLink] = []
+    for geo in geo_pages or []:
+        links.append(InternalLink(
+            from_page_id=geo.parent_pillar_id,
+            to_page_id=geo.id,
+            anchor_text=f"{geo.title}"[:70],
+            relationship=LinkRelationship.PILLAR_TO_GEO,
+            reasoning="Pillar to regional variant.",
+        ))
+        links.append(InternalLink(
+            from_page_id=geo.id,
+            to_page_id=geo.parent_pillar_id,
+            anchor_text=f"our full {geo.title.split(' in ')[0]} services"[:70],
+            relationship=LinkRelationship.GEO_TO_PILLAR,
+            reasoning="Geo page to parent pillar.",
+        ))
+    return links
+
+
 # ── LLM: entity bridges only ──────────────────────────────────────────────────
 
 def _generate_entity_bridges(pillars: list[Pillar]) -> list[InternalLink]:
@@ -300,11 +325,12 @@ def _deterministic_entity_bridges(pillars: list[Pillar], min_per_pillar: int = 2
 
 # ── Main builder ──────────────────────────────────────────────────────────────
 
-def build_linking_plan(pillars: list[Pillar]) -> LinkingPlan:
+def build_linking_plan(pillars: list[Pillar], geo_pages: list | None = None) -> LinkingPlan:
     """
     Build the complete internal linking plan.
 
-    Deterministic (0 tokens): pillar↔cluster, cluster↔supplementary, homepage
+    Deterministic (0 tokens): pillar↔cluster, cluster↔supplementary,
+                              pillar↔geo, homepage
     LLM (1 call, ~3k tokens): entity bridges across pillars
     """
     all_links: list[InternalLink] = []
@@ -312,6 +338,7 @@ def build_linking_plan(pillars: list[Pillar]) -> LinkingPlan:
     # Deterministic — free
     all_links.extend(_pillar_cluster_links(pillars))
     all_links.extend(_supplementary_links(pillars))
+    all_links.extend(_geo_page_links(geo_pages))
     homepage_links = _homepage_links(pillars)
 
     # LLM — one call only

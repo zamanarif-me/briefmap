@@ -192,6 +192,10 @@ def heartbeat(run_id: str, message: str = "") -> None:
 
 def mark_run_completed(run_id: str, message: str = "Pipeline complete") -> None:
     progress = read_progress(run_id) or init_progress(run_id)
+    # A run the user cancelled (status=failed) must never be flipped back to
+    # completed by a worker that was still finishing its last stage.
+    if progress.get("status") == "failed":
+        return
     progress["status"]          = "completed"
     progress["message"]         = message
     progress["last_updated_at"] = _now_iso()
@@ -262,6 +266,34 @@ def next_stage_to_run(run_id: str) -> Optional[str]:
         if stage not in completed:
             return stage
     return None
+
+
+# ── Cancellation ─────────────────────────────────────────────────────────────
+# Python threads can't be killed, so cancellation is cooperative: the UI
+# writes a _cancel flag file and the pipeline checks it between stages.
+
+def _cancel_path(run_id: str) -> Path:
+    return run_dir(run_id) / "_cancel"
+
+
+def request_cancel(run_id: str) -> None:
+    """Ask the worker to stop at the next stage boundary."""
+    _atomic_write_text(_cancel_path(run_id), _now_iso())
+
+
+def cancel_requested(run_id: str) -> bool:
+    try:
+        return _cancel_path(run_id).exists()
+    except Exception:
+        return False
+
+
+def clear_cancel(run_id: str) -> None:
+    """Remove a stale cancel flag (called before spawning a fresh worker)."""
+    try:
+        _cancel_path(run_id).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── Checkpoint helpers ───────────────────────────────────────────────────────

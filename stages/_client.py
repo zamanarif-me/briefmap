@@ -35,7 +35,7 @@ from pydantic import BaseModel, ValidationError
 T = TypeVar("T", bound=BaseModel)
 
 # ── Model constants ──────────────────────────────────────────────────────────
-ANTHROPIC_SONNET   = "claude-sonnet-4-6"           # main reasoning model
+ANTHROPIC_SONNET   = "claude-sonnet-5"             # main reasoning model
 ANTHROPIC_HAIKU    = "claude-haiku-4-5"            # cheap structured work
 GEMINI_FLASH       = "gemini-2.5-flash"            # fast + cheap (1.5 family is retired)
 GEMINI_PRO         = "gemini-2.5-pro"              # large context window
@@ -171,12 +171,17 @@ def call_structured(
 
 # ── Provider-specific call helpers ────────────────────────────────────────────
 
-def _log_usage(stage: str, model: str, input_tokens: int, output_tokens: int) -> None:
+def _log_usage(
+    stage: str, model: str, input_tokens: int, output_tokens: int,
+    cache_write_tokens: int = 0, cache_read_tokens: int = 0,
+) -> None:
     from stages.cost_tracker import current_tracker
     current_tracker().log_llm_call(
         stage=stage, model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
     )
 
 
@@ -199,10 +204,15 @@ def _call_anthropic(
     """
     client = get_anthropic_client()
 
+    # Claude Sonnet 5 rejects non-default temperature/top_p/top_k with a 400,
+    # and runs adaptive thinking when `thinking` is omitted. This pipeline
+    # wants deterministic structured JSON, so thinking is disabled explicitly
+    # and the temperature argument is accepted for interface compatibility
+    # but not sent. (Gemini calls still honor temperature.)
     kwargs: dict[str, Any] = {
         "model":       model,
         "max_tokens":  max_tokens,
-        "temperature": temperature,
+        "thinking":    {"type": "disabled"},
         "system": [
             {
                 "type": "text",
@@ -234,7 +244,13 @@ def _call_anthropic(
         response = client.messages.create(**kwargs)
 
     usage = response.usage
-    _log_usage(stage, model, usage.input_tokens, usage.output_tokens)
+    # Cached tokens are reported SEPARATELY from usage.input_tokens — without
+    # these the cost report undercounts every cache-warm call.
+    _log_usage(
+        stage, model, usage.input_tokens, usage.output_tokens,
+        cache_write_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+    )
 
     for block in response.content:
         if getattr(block, "type", "") == "tool_use":

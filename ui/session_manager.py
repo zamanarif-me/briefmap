@@ -19,6 +19,11 @@ from pathlib import Path
 SESSIONS_DIR = Path("sessions")
 INDEX_FILE   = SESSIONS_DIR / "index.json"
 
+# Same shape as run_state.RUN_ID_RE — session ids are run ids. This guard
+# keeps path traversal out of session_dir()/delete_session() (rmtree!) even
+# if a caller ever passes an id from an untrusted source.
+_SESSION_ID_RE = re.compile(r"^\d{8}_\d{6}_[a-z0-9_]{1,40}$")
+
 
 # ── Meta ──────────────────────────────────────────────────────────────────────
 
@@ -34,6 +39,8 @@ def _session_id(seed: str) -> str:
 
 
 def session_dir(session_id: str) -> Path:
+    if not session_id or not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(f"Invalid session_id: {session_id!r}")
     return SESSIONS_DIR / session_id
 
 
@@ -129,7 +136,10 @@ def load_session(session_id: str):
     """
     from models import EngineOutput
 
-    out_dir = session_dir(session_id)
+    try:
+        out_dir = session_dir(session_id)
+    except ValueError:
+        return None, None
     json_path = out_dir / "topical_map.json"
     meta_path = out_dir / "session_meta.json"
 
@@ -149,7 +159,10 @@ def load_session(session_id: str):
 def delete_session(session_id: str) -> bool:
     """Delete a session and remove from index."""
     import shutil
-    out_dir = session_dir(session_id)
+    try:
+        out_dir = session_dir(session_id)
+    except ValueError:
+        return False
     if out_dir.exists():
         shutil.rmtree(out_dir)
     sessions = [s for s in _load_index() if s.get("session_id") != session_id]

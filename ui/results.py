@@ -1,5 +1,6 @@
 """Results page — displays the topical map output."""
 
+import html
 import json
 import streamlit as st
 from pathlib import Path
@@ -7,9 +8,33 @@ from pathlib import Path
 from ui.router import set_page
 
 
+def _restore_output_from_disk():
+    """
+    Reconnect fallback: session_state is gone but the URL still carries the
+    run id — reload the completed output from disk so ?page=results survives
+    a WebSocket drop (the router's 'URL is source of truth' contract).
+    """
+    run_id = st.session_state.get("active_run_id")
+    if not run_id:
+        return None, None
+    try:
+        from ui.pipeline import _load_completed_output
+        return _load_completed_output(run_id)
+    except Exception:
+        return None, None
+
+
 def render_results():
     output = st.session_state.get("output")
     output_dir = st.session_state.get("output_dir", "streamlit_output")
+
+    if not output:
+        output, restored_dir = _restore_output_from_disk()
+        if output:
+            st.session_state.output = output
+            if restored_dir:
+                st.session_state.output_dir = restored_dir
+                output_dir = restored_dir
 
     if not output:
         st.warning("No results yet. Generate a topical map first.")
@@ -117,11 +142,13 @@ def _render_pillars(tm):
                 angles = list(set(s.angle for s in c.supplementary_nodes if s.angle))
                 angle_str = " · ".join(angles) if angles else ""
 
+                # Titles and angles are LLM output (and SERP-influenced) —
+                # escape before rendering with unsafe_allow_html.
                 st.markdown(
-                    f"&nbsp;&nbsp;• **{c.title}** "
+                    f"&nbsp;&nbsp;• **{html.escape(c.title)}** "
                     f"<span class='tag tag-{c.intent.value}'>{c.intent.value}</span> "
                     f"— {supp_count} supp · {query_count} queries"
-                    + (f" · *{angle_str}*" if angle_str else ""),
+                    + (f" · *{html.escape(angle_str)}*" if angle_str else ""),
                     unsafe_allow_html=True,
                 )
 
@@ -144,12 +171,13 @@ def _render_bridges(bridges):
     for b in bridges:
         strength = b.relationship_strength or 0.0
         strength_color = "#43e97b" if strength >= 0.85 else "#ffc107" if strength >= 0.65 else "#ff6b6b"
+        # Anchor text, reasoning, and ids come from the LLM — escape them.
         st.markdown(
             f"<span style='color:{strength_color}; font-family: DM Mono, monospace;'>"
             f"[{strength:.2f}]</span> "
-            f"`{b.from_page_id}` → `{b.to_page_id}`<br>"
+            f"`{html.escape(b.from_page_id)}` → `{html.escape(b.to_page_id)}`<br>"
             f"<span style='color:#6b6b8a; font-size:0.85rem;'>"
-            f"Anchor: \"{b.anchor_text}\" · {b.reasoning}</span>",
+            f"Anchor: \"{html.escape(b.anchor_text)}\" · {html.escape(b.reasoning)}</span>",
             unsafe_allow_html=True,
         )
         st.markdown("")

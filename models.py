@@ -87,6 +87,8 @@ class LinkRelationship(str, Enum):
     ENTITY_BRIDGE = "entity_bridge"          # links between pages sharing a key entity
     CONTEXTUAL = "contextual"                # general topical relevance
     HOMEPAGE_TO_PILLAR = "homepage_to_pillar"
+    PILLAR_TO_GEO = "pillar_to_geo"          # pillar links its regional variants
+    GEO_TO_PILLAR = "geo_to_pillar"          # geo page links back to parent pillar
 
 
 # ---------- Input ----------

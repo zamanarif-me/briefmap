@@ -65,6 +65,16 @@ def _log(msg: str):
     _safe_stdout_write(f"[pipeline] {msg}\n")
 
 
+class PipelineCancelled(Exception):
+    """Raised between stages when the user requested cancellation."""
+
+
+def _check_cancel(run_id: str) -> None:
+    from ui import run_state
+    if run_state.cancel_requested(run_id):
+        raise PipelineCancelled(f"Run {run_id} cancelled by user")
+
+
 # ── Serialization helpers for SerpData (dataclass, not pydantic) ──────────────
 
 def _serpdata_to_dict(s: SerpData) -> dict:
@@ -158,6 +168,7 @@ def run_pipeline(
     # NOTE on all stages below: read_checkpoint() returns None for a missing
     # OR corrupt checkpoint file, so a half-written checkpoint (crash mid-
     # write) re-runs the stage instead of crashing the resume.
+    _check_cancel(run_id)
     cp = run_state.read_checkpoint(run_id, "stage2")
     if cp and "central_entity" in cp:
         central = CentralEntity.model_validate(cp["central_entity"])
@@ -173,6 +184,7 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage2", f"Central entity: {central.primary}")
 
     # ── Stage 3: Topic Expansion (Anthropic) ─────────────────────────────────
+    _check_cancel(run_id)
     cp = run_state.read_checkpoint(run_id, "stage3")
     if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
@@ -189,6 +201,7 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage3", f"{len(pillars)} pillars expanded")
 
     # ── Stage 3.5: SERP Intelligence (Serper.dev) ────────────────────────────
+    _check_cancel(run_id)
     serp_data: Optional[dict[str, SerpData]] = None
     cp = None if skip_serp else run_state.read_checkpoint(run_id, "stage3_5")
     if skip_serp:
@@ -219,6 +232,7 @@ def run_pipeline(
             _log(f"  WARNING: could not persist serp_data.json: {e}")
 
     # ── Stage 4: Validation ──────────────────────────────────────────────────
+    _check_cancel(run_id)
     cp = None if skip_validation else run_state.read_checkpoint(run_id, "stage4")
     if skip_validation:
         _log("Stage 4: SKIPPED (skip_validation=True)")
@@ -251,6 +265,7 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage4", f"strong:{strong} medium:{medium} weak:{weak}")
 
     # ── Stage 5: Query Generation (Anthropic + Serper PAA) ───────────────────
+    _check_cancel(run_id)
     cp = run_state.read_checkpoint(run_id, "stage5")
     if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
@@ -274,6 +289,7 @@ def run_pipeline(
         run_state.mark_stage_complete(run_id, "stage5", f"{total_queries} queries generated")
 
     # ── Stage 6: Supplementary Nodes (Gemini Flash + Serper related) ─────────
+    _check_cancel(run_id)
     cp = run_state.read_checkpoint(run_id, "stage6")
     if cp and "pillars" in cp:
         pillars = [Pillar.model_validate(p) for p in cp["pillars"]]
@@ -319,6 +335,7 @@ def run_pipeline(
     )
 
     # ── Stage 7: Internal Linking (Anthropic) ────────────────────────────────
+    _check_cancel(run_id)
     cp = run_state.read_checkpoint(run_id, "stage7")
     if cp and "linking_plan" in cp:
         linking_plan = LinkingPlan.model_validate(cp["linking_plan"])
@@ -326,7 +343,7 @@ def run_pipeline(
     else:
         _log("Stage 7: building internal linking plan [Anthropic]...")
         run_state.heartbeat(run_id, "Stage 7: building internal linking plan...")
-        linking_plan = build_linking_plan(pillars)
+        linking_plan = build_linking_plan(pillars, geo_pages=geo_pages)
         _log(f"  {len(linking_plan.links)} links | {len(linking_plan.homepage_links)} homepage links")
         run_state.write_checkpoint(run_id, "stage7", {
             "linking_plan": linking_plan.model_dump(mode="json"),
@@ -340,6 +357,7 @@ def run_pipeline(
     )
 
     # ── Stage 8: Render ──────────────────────────────────────────────────────
+    _check_cancel(run_id)
     if run_state.read_checkpoint(run_id, "stage8") is not None:
         _log("Stage 8: SKIPPED (checkpoint found) — outputs already rendered")
     else:
@@ -365,16 +383,10 @@ def run_pipeline(
     except Exception as e:
         _log(f"Session save skipped: {e}")
 
-    # Attach run metadata BEFORE marking the run completed, so a failure
-    # here cannot flip an already-completed run to "failed".
-    try:
-        final_output._session_id = run_id
-        final_output._run_id = run_id
-    except Exception:
-        pass
-
     # Mark the run as fully completed in run_state — last, nothing after this
-    # can raise.
+    # can raise. (mark_run_completed refuses to overwrite a user-cancelled
+    # run, so a worker finishing after a Stop click can't flip it back.)
+    _check_cancel(run_id)
     run_state.mark_run_completed(run_id, "Pipeline complete")
 
     return final_output
